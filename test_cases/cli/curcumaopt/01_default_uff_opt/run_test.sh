@@ -21,7 +21,8 @@ run_test() {
     local exit_code=$?
 
     # Note: curcuma may return exit 1 even on success (known bug), so check output file instead
-    assert_curcuma_success "input.opt.xyz" "UFF optimization completed successfully"
+    local opt_file=$(bmt_find_file input opt.xyz)
+    assert_curcuma_success "$opt_file" "UFF optimization completed successfully"
 
     # Check for completion message (optional, since verbosity may be 0)
     if grep -qi "converged\|finished\|complete" stdout.log 2>/dev/null; then
@@ -35,12 +36,13 @@ run_test() {
 
 validate_results() {
     # Scientific validation: Check optimized energy is physically reasonable
-    if [ ! -f "input.opt.xyz" ]; then
+    local opt_file=$(bmt_find_file input opt.xyz)
+    if [ ! -f "$opt_file" ]; then
         echo -e "${RED}✗${NC} Cannot validate: input.opt.xyz missing"
         return 1
     fi
 
-    local final_energy=$(extract_energy_from_xyz "input.opt.xyz")
+    local final_energy=$(extract_energy_from_xyz "$opt_file")
 
     if [ -z "$final_energy" ]; then
         echo -e "${YELLOW}⚠${NC} Could not extract energy from XYZ comment"

@@ -12,13 +12,15 @@ run_test() {
     cd "$TEST_DIR"
     $CURCUMA -opt input.xyz -method uff > stdout.log 2> stderr.log
     assert_exit_code $? 0 "Optimization should succeed"
-    assert_curcuma_success "input.opt.xyz" "Optimized structure created"
+    local opt_file=$(bmt_find_file input opt.xyz)
+    assert_curcuma_success "$opt_file" "Optimized structure created"
     return 0
 }
 
 validate_results() {
-    if [ -f "input.opt.xyz" ]; then
-        local energy=$(extract_energy_from_xyz "input.opt.xyz")
+    local opt_file=$(bmt_find_file input opt.xyz)
+    if [ -f "$opt_file" ]; then
+        local energy=$(extract_energy_from_xyz "$opt_file")
         if [ -z "$energy" ]; then
             echo -e "${YELLOW}⚠${NC} No energy extracted (may be rounded to 0)"
             TESTS_RUN=$((TESTS_RUN + 1))

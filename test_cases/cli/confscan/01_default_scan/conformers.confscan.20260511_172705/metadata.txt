@@ -1,0 +1,5 @@
+# Curcuma Calculation Metadata
+basename: conformers
+method: confscan
+timestamp: 2026-05-11 17:27:05
+input_file: conformers.xyz

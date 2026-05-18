@@ -1,0 +1,5 @@
+# Curcuma Calculation Metadata
+basename: input
+method: opt
+timestamp: 2026-05-11 17:26:30
+input_file: input.xyz

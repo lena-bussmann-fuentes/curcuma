@@ -20,14 +20,14 @@ run_test() {
         > stdout.log 2> stderr.log
     
     assert_exit_code $? 0 "ConfScan should succeed"
-    assert_file_exists "conformers.accepted.xyz" "Accepted conformers"
-    assert_file_exists "conformers.rejected.xyz" "Rejected conformers"
+    assert_file_exists "$(bmt_find_file conformers accepted.xyz)" "Accepted conformers"
+    assert_file_exists "$(bmt_find_file conformers rejected.xyz)" "Rejected conformers"
     return 0
 }
 
 validate_results() {
-    local accepted=$(count_xyz_structures "conformers.accepted.xyz")
-    local rejected=$(count_xyz_structures "conformers.rejected.xyz")
+    local accepted=$(count_xyz_structures "$(bmt_find_file conformers accepted.xyz)")
+    local rejected=$(count_xyz_structures "$(bmt_find_file conformers rejected.xyz)")
     assert_numeric_match 14 "$accepted" "Accepted conformers"
     assert_numeric_match 30 "$rejected" "Rejected conformers"
     return 0

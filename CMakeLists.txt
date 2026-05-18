@@ -418,6 +418,7 @@ set(curcuma_core_SRC
         src/core/energy_calculators/qm_methods/orcainterface.h
         src/core/energy_calculators/qm_methods/orcainterface.cpp
         src/tools/trajectory_writer.cpp
+        src/tools/bmt_utils.cpp
         src/core/imagewriter.cpp
         src/core/parameter_registry.cpp
         src/core/config_manager.cpp

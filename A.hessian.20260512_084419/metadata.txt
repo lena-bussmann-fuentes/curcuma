@@ -1,0 +1,5 @@
+# Curcuma Calculation Metadata
+basename: A
+method: hessian
+timestamp: 2026-05-12 08:44:19
+input_file: /home/lena/sourcecode/curcuma/build/A.xyz

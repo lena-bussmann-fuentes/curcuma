@@ -1,0 +1,5 @@
+# Curcuma Calculation Metadata
+basename: diala
+method: opt
+timestamp: 2026-05-11 17:35:02
+input_file: diala.xyz

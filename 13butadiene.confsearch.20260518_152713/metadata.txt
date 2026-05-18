@@ -1,0 +1,5 @@
+# Curcuma Calculation Metadata
+basename: 13butadiene
+method: confsearch
+timestamp: 2026-05-18 15:27:13
+input_file: /tmp/13butadiene.xyz

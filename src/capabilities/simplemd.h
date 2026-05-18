@@ -169,6 +169,12 @@ public:
     */
     bool Initialise() override;
 
+    // Claude Generated 2026: Path for JSON restart files (inside .snapshots subdir when BMT active)
+    inline std::string snapshotPath(const std::string& filename) const {
+        return m_snapshots_dir.empty() ? outputPath(filename) : m_snapshots_dir + "/" + filename;
+    }
+    inline void setSnapshotsDir(const std::string& dir) { m_snapshots_dir = dir; }
+
     void start() override;
 
     std::vector<Molecule*> UniqueMolecules() const { return m_unique_structures; }
@@ -375,6 +381,7 @@ private:
     Matrix m_topo_initial;
     std::vector<Molecule*> m_unique_structures;
     std::string m_method = "UFF", m_initfile = "none", m_thermostat = "csvr", m_plumed, m_rmsd_ref_file, m_rmsd_atoms = "-1", m_scaling_json = "none";
+    std::string m_snapshots_dir;  // Claude Generated 2026: path for JSON restart files (.snapshots inside BMT)
     bool m_unstable = false;
     bool m_dipole = false;
     bool m_clean_energy = false;
@@ -537,6 +544,17 @@ public:
         m_mddriver = new SimpleMD(controller, false);
         m_mddriver->setMolecule(m_molecule);
         m_mddriver->overrideBasename(m_basename + ".t" + std::to_string(getThreadId()));
+        // Claude Generated 2026: Keep m_output_dir at BMT root, create snapshots subdir for JSON restarts
+        if (m_mddriver->OutputDir().empty()) {
+            m_mddriver->setOutputDir(m_mddriver->Basename() + ".snapshots");
+        } else {
+            m_mddriver->setSnapshotsDir(m_mddriver->outputPath(m_mddriver->Basename() + ".snapshots"));
+#ifdef C17
+#ifndef _WIN32
+            std::filesystem::create_directories(m_mddriver->snapshotPath(""));
+#endif
+#endif
+        }
         m_mddriver->Initialise();
         m_mddriver->start();
         return 0;

@@ -347,4 +347,29 @@ cleanup_test_artifacts() {
     rm -f *.reorder.*.xyz *.centered.xyz *.reordered.xyz
     rm -f *.log *.dat *.pairs
     rm -f stdout.log stderr.log
+    # Remove BMT directories (Basename.Method.Timestamp pattern)
+    rm -rf *.*.*/
+}
+
+# Helper: Find output file in BMT directory or CWD
+# Usage: bmt_find_file <basename> <suffix>
+# Example: bmt_find_file conformers accepted.xyz
+# Returns the full path to the file, searching BMT dirs first (newest), then CWD
+bmt_find_file() {
+    local basename=$1
+    local suffix=$2
+    # Search in BMT directories first (newest first - sorted by modification time)
+    local bmt_dir=$(ls -td ${basename}.*.*/ 2>/dev/null | head -1)
+    if [ -n "$bmt_dir" ] && [ -f "${bmt_dir}${basename}.${suffix}" ]; then
+        echo "${bmt_dir}${basename}.${suffix}"
+    elif [ -f "${basename}.${suffix}" ]; then
+        echo "${basename}.${suffix}"
+    else
+        # Try finding the file directly in any BMT directory (newest first)
+        local found=$(find . -maxdepth 2 -name "${basename}.${suffix}" -type f -newer "${basename}.*.*/metadata.txt" 2>/dev/null | head -1)
+        if [ -z "$found" ]; then
+            found=$(find . -maxdepth 2 -name "${basename}.${suffix}" -type f 2>/dev/null | head -1)
+        fi
+        echo "$found"
+    fi
 }
