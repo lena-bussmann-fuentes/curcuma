@@ -118,6 +118,10 @@ add_cli_test(simplemd 08_gfnff_acetic_acid_dimer_md)
 add_cli_test(simplemd 09_xtbgfnff_acetic_acid_dimer_md)
 add_cli_test(simplemd 10_gfnff_polymer_md)
 set_tests_properties(cli_simplemd_10_gfnff_polymer_md PROPERTIES TIMEOUT 3600 LABELS "simplemd;gfnff;large_system;performance")
+add_cli_test(simplemd 11_diagnostics_dump)
+set_tests_properties(cli_simplemd_11_diagnostics_dump PROPERTIES TIMEOUT 180 LABELS "simplemd;gfnff;diagnostics")
+add_cli_test(simplemd 12_eeq_cutoff_auto)
+set_tests_properties(cli_simplemd_12_eeq_cutoff_auto PROPERTIES TIMEOUT 180 LABELS "simplemd;gfnff;eeq_cutoff")
 
 # =============================================================================
 # CG (Coarse Graining) Tests — disabled: -vtf command not implemented in main.cpp
