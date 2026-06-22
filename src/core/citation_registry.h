@@ -27,8 +27,14 @@ public:
 
     /// Write BibTeX file with all cited methods that have bibtex entries.
     /// filename: full path. If empty, derives from basename in CWD.
+    /// If setOutputDir() was called, uses that directory regardless of output_dir param.
     static void writeBibTeX(const std::string& output_dir = "",
                              const std::string& basename = "");
+
+    /// Set the output directory for BibTeX writing (typically the BMT directory).
+    /// Called by capabilities after createBMTDir(). The CitationGuard in main()
+    /// will use this if set, otherwise falls back to CWD.
+    static void setOutputDir(const std::string& dir);
 
     /// Clear registry (for testing)
     static void clear();
@@ -40,4 +46,5 @@ private:
     static std::vector<std::string> m_cited_keys;                        // ordered, deduped
     static std::set<std::string> m_seen;                                  // fast lookup
     static std::vector<std::pair<std::string, std::string>> m_subrefs;   // (child, parent)
+    static std::string m_output_dir;                                      // BMT directory for BibTeX output
 };

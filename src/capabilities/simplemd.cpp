@@ -59,11 +59,12 @@
 const double au2eV = 1.0 / eV2Eh; // Convert Hartree to eV
 const double au2N = 8.2387225e-8; // Convert atomic force units (Eh/bohr) to Newton
 
-BiasThread::BiasThread(const Molecule& reference, const json& rmsdconfig, bool nocolvarfile, bool nohillsfile)
+BiasThread::BiasThread(const Molecule& reference, const json& rmsdconfig, bool nocolvarfile, bool nohillsfile, const std::string& mtd_dir)
     : m_reference(reference)
     , m_target(reference)
     , m_nocolvarfile(nocolvarfile)
     , m_nohillsfile(nohillsfile)
+    , m_mtd_dir(mtd_dir)
     , m_driver(rmsdconfig, true)
 {
     m_config = rmsdconfig;
@@ -113,7 +114,8 @@ int BiasThread::execute()
         m_current_bias += bias_energy;
         if (m_nocolvarfile == false) {
             std::ofstream colvarfile;
-            colvarfile.open("COLVAR_" + std::to_string(m_biased_structures[i].index), std::iostream::app);
+            std::string colvar_path = m_mtd_dir.empty() ? "COLVAR_" + std::to_string(m_biased_structures[i].index) : m_mtd_dir + "/COLVAR_" + std::to_string(m_biased_structures[i].index);
+            colvarfile.open(colvar_path, std::iostream::app);
             colvarfile << m_currentStep << " " << rmsd << " " << bias_energy << " " << m_biased_structures[i].counter << " " << factor << std::endl;
             colvarfile.close();
         }
@@ -241,7 +243,7 @@ void SimpleMD::LoadControlJson()
     m_max_rmsd_N = m_config.get<int>("rmsd_mtd_max_gaussians");
     m_rmsd_econv = m_config.get<double>("rmsd_econv", 1e8);  // Not in PARAM block - legacy
     m_rmsd_DT = m_config.get<double>("rmsd_mtd_dt");
-    m_wtmtd = m_config.get<bool>("wtmtd", false);  // Not in PARAM block - legacy
+    m_wtmtd = m_config.get<bool>("wtmtd");
     m_rmsd_ref_file = m_config.get<std::string>("rmsd_mtd_ref_file");
     m_rmsd_fix_structure = m_config.get<bool>("rmsd_fix_structure", false);  // Not in PARAM block - legacy
     m_nocolvarfile = m_config.get<bool>("noCOLVARfile", false);  // Not in PARAM block - legacy
@@ -402,14 +404,17 @@ void SimpleMD::printHelp() const
 
     std::cout << "\nExample usage:\n"
               << "  curcuma -md input.xyz -max_time 10000 -temperature 300 -thermostat csvr\n"
-              << "  curcuma -md input.xyz -method gfn2 -wall_type spheric -wall_radius 10.0\n\n"
+              << "  curcuma -md input.xyz -method gfn2 -wall_type spheric -wall_radius 10.0\n"
+              << "  curcuma -md input.xyz -rmsd_mtd true -rmsd_mtd_k 0.01 -rmsd_mtd_ref_file refs.xyz\n\n"
               << "Usage Tips:\n"
               << "- For stable dynamics, use time_step ≤ 1.0 fs\n"
               << "- The Berendsen thermostat is efficient but doesn't sample canonical ensemble\n"
               << "- For proper NVT sampling, use CSVR or Nosé-Hoover thermostats\n"
               << "- RATTLE constraints allow larger timesteps for bonds involving H atoms\n"
               << "- Wall potentials prevent molecules from drifting too far\n"
-              << "- Metadynamics helps explore conformational space efficiently\n"
+              << "- RMSD-MTD biases the simulation away from known reference structures;\n"
+              << "  use -rmsd_mtd true with -rmsd_mtd_ref_file <file> to explore new conformers.\n"
+              << "- See 'curcuma -help-module simplemd' for all RMSD-MTD parameters.\n"
               << std::endl;
 }
 
@@ -433,6 +438,17 @@ bool SimpleMD::Initialise()
 #endif
 #endif
     }
+
+    // Claude Generated 2026: Create .rmsd_mtd subdirectory inside BMT for COLVAR files
+    if (m_rmsd_mtd && !OutputDir().empty()) {
+        m_mtd_dir = outputPath(Basename() + ".rmsd_mtd");
+#ifdef C17
+#ifndef _WIN32
+        std::filesystem::create_directories(m_mtd_dir);
+#endif
+#endif
+    }
+
     m_natoms = m_molecule.AtomCount();
     if(m_natoms == 0)
         return false;
@@ -704,6 +720,11 @@ bool SimpleMD::Initialise()
         }
     }
 
+    // Claude Generated (June 2026): Pass output_dir for BMT-aware .topo.json routing
+    if (!OutputDir().empty()) {
+        ec_config["output_dir"] = OutputDir();
+    }
+
     m_interface = new EnergyCalculator(m_method, ec_config, Basename());
 
     m_interface->setMolecule(m_molecule.getMolInfo());
@@ -761,7 +782,7 @@ bool SimpleMD::Initialise()
         config["silent"] = true;
         config["reorder"] = false;
         for (int i = 0; i < m_threads; ++i) {
-            auto* thread = new BiasThread(m_rmsd_mtd_molecule, config, m_nocolvarfile, m_nohillsfile);
+            auto* thread = new BiasThread(m_rmsd_mtd_molecule, config, m_nocolvarfile, m_nohillsfile, m_mtd_dir);
             thread->setDT(m_rmsd_DT);
             thread->setk(m_k_rmsd);
             thread->setalpha(m_alpha_rmsd);
@@ -2514,7 +2535,7 @@ void SimpleMD::ApplyRMSDMTD()
         m_rmsd_mtd_molecule.writeXYZFile(outputPath(Basename() + ".mtd.xyz"));
         if (m_nocolvarfile == false) {
             std::ofstream colvarfile;
-            colvarfile.open("COLVAR");
+            colvarfile.open(mtdPath("COLVAR"));
             colvarfile.close();
         }
     }
@@ -2567,7 +2588,7 @@ void SimpleMD::ApplyRMSDMTD()
 
     if (m_nocolvarfile == false) {
         std::ofstream colvarfile;
-        colvarfile.open("COLVAR", std::iostream::app);
+        colvarfile.open(mtdPath("COLVAR"), std::iostream::app);
         colvarfile << m_currentStep << " ";
         if (m_rmsd_fragment_count < 2)
             colvarfile << rmsd_reference << " ";

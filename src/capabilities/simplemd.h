@@ -56,7 +56,7 @@ struct BiasStructure {
 
 class BiasThread : public CxxThread {
 public:
-    BiasThread(const Molecule& reference, const json& rmsdconfig, bool nocolvarfile, bool nohillsfile);
+    BiasThread(const Molecule& reference, const json& rmsdconfig, bool nocolvarfile, bool nohillsfile, const std::string& mtd_dir = "");
     ~BiasThread();
 
     virtual int execute() override;
@@ -71,7 +71,8 @@ public:
         m_biased_structures.push_back(str);
         if (m_nocolvarfile == false) {
             std::ofstream colvarfile;
-            colvarfile.open("COLVAR_" + std::to_string(index));
+            std::string colvar_path = m_mtd_dir.empty() ? "COLVAR_" + std::to_string(index) : m_mtd_dir + "/COLVAR_" + std::to_string(index);
+            colvarfile.open(colvar_path);
             colvarfile << "#m_currentStep  rmsd  bias_energy   counter  factor" << std::endl;
             colvarfile.close();
         }
@@ -126,6 +127,7 @@ private:
     double m_k, m_alpha, m_DT, m_currentStep, m_rmsd_reference, m_current_bias, m_rmsd_econv, m_dT = 1;
     int m_counter = 0, m_atoms = 0;
     bool m_wtmtd = false, m_nocolvarfile = false, m_nohillsfile = false;
+    std::string m_mtd_dir;  // BMT/Basename.rmsd_mtd subdirectory for COLVAR files
 };
 
 // Claude Generated 2025: CurcumaMDJson removed - replaced by ParameterRegistry + ConfigManager
@@ -226,6 +228,13 @@ private:
         return m_snapshots_dir + "/" + filename;
     }
 
+    // Claude Generated 2026: Build path inside rmsd_mtd subdirectory
+    std::string mtdPath(const std::string& filename) const {
+        if (m_mtd_dir.empty())
+            return outputPath(filename);
+        return m_mtd_dir + "/" + filename;
+    }
+
     /* Lets have this for all modules */
     virtual nlohmann::json WriteRestartInformation() override;
 
@@ -304,6 +313,7 @@ private:
 #endif
 
     std::string m_snapshots_dir;  // Claude Generated 2026: Snapshots subdirectory inside BMT
+    std::string m_mtd_dir;        // Claude Generated 2026: RMSD-MTD subdirectory inside BMT
 
     int m_natoms = 0;
     int m_dump = 1;
@@ -523,6 +533,7 @@ private:
     PARAM(rmsd_mtd_ref_file, String, "none", "File with reference structures for RMSD-MTD.", "RMSD-MTD", {"rmsd_ref_file"})
     PARAM(rmsd_mtd_atoms, String, "-1", "Atom indices to use for RMSD calculation.", "RMSD-MTD", {"rmsd_atoms"})
     PARAM(rmsd_mtd_dt, Double, 1000000.0, "RMSD-MTD bias deposition time.", "RMSD-MTD", {"rmsd_DT"})
+    PARAM(wtmtd, Bool, false, "Enable well-tempered metadynamics (adaptive bias deposition).", "RMSD-MTD", {})
 
     // --- Coarse Graining (CG) Parameters --- Claude Generated (Nov 2025)
     PARAM(cg_write_vtf, Bool, true, "Write VTF trajectory for CG systems.", "CG", {"write_vtf"})

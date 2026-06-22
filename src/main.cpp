@@ -990,6 +990,9 @@ void initializeBMT(CurcumaMethod* method, const std::string& filename,
     method->setFile(filename);
     method->createBMTDir(cli_keyword);
 
+    // Claude Generated 2026: Route citations.bib into BMT directory
+    CitationRegistry::setOutputDir(method->OutputDir());
+
     // Register -bak files for post-computation copy to CWD
     if (controller.contains("bak")) {
         if (controller["bak"].is_string()) {
@@ -1492,6 +1495,7 @@ int executeAnalysis(const json& controller, int argc, char** argv) {
     std::string analysis_basename = BMTUtils::stripExtension(analysis_filename);
     std::string analysis_bmt_dir = BMTUtils::createBMTDir(analysis_basename, "analysis");
     BMTUtils::writeMetadata(analysis_bmt_dir, analysis_basename, "analysis", analysis_filename);
+    CitationRegistry::setOutputDir(analysis_bmt_dir);
 
     auto* analysis = new UnifiedAnalysis(analysis_config, false);
     analysis->setFileName(argv[2]);
@@ -1549,6 +1553,7 @@ int executeRMSD(const json& controller, int argc, char** argv) {
     std::string rmsd_basename = reffile;
     std::string rmsd_bmt_dir = BMTUtils::createBMTDir(rmsd_basename, "rmsd");
     BMTUtils::writeMetadata(rmsd_bmt_dir, rmsd_basename, "rmsd", std::string(argv[2]));
+    CitationRegistry::setOutputDir(rmsd_bmt_dir);
 
     driver->ReferenceAligned().writeXYZFile(BMTUtils::outputPath(rmsd_bmt_dir, reffile + ".centered.xyz"));
     driver->TargetAligned().writeXYZFile(BMTUtils::outputPath(rmsd_bmt_dir, tarfile + ".centered.xyz"));
@@ -1674,6 +1679,7 @@ int executeOptimization(const json& controller, int argc, char** argv) {
         std::string basename = BMTUtils::stripExtension(filename);
         std::string bmt_dir = BMTUtils::createBMTDir(basename, "opt");
         BMTUtils::writeMetadata(bmt_dir, basename, "opt", filename);
+        CitationRegistry::setOutputDir(bmt_dir);
 
         Optimization::OptimizerType opt_type = Optimization::parseOptimizerType(optimizer_method);
         auto result = Optimization::OptimizationDispatcher::optimizeStructure(
@@ -1891,7 +1897,7 @@ const std::map<std::string, CapabilityInfo> CAPABILITY_REGISTRY = {
                   {"XYZ", "MOL2", "SDF"}, executeConfStat}},
     {"dock", {"Molecular docking calculations", "docking",
               {"XYZ", "MOL2", "SDF"}, executeDocking}},
-    {"md", {"Molecular dynamics simulation", "dynamics",
+    {"md", {"Molecular dynamics simulation (incl. RMSD-MTD enhanced sampling)", "dynamics",
             {"XYZ", "VTF", "MOL2", "SDF"}, executeSimpleMD}},
     {"casino", {"Casino Monte Carlo simulation with enhanced sampling", "dynamics",
                 {"XYZ", "VTF", "MOL2", "SDF", "PDB"}, executeCasino}},
@@ -1947,6 +1953,124 @@ const std::map<std::string, CapabilityInfo> CAPABILITY_REGISTRY = {
                  {"XYZ", "MOL2", "PDB", "SDF"}, executeTorsion}},
     // TODO: Add more capabilities here as they are converted
 };
+
+// Claude Generated (June 2026): Metadynamics topic help page
+static void printMetadynamicsHelp()
+{
+    std::cout << "===============================================================" << std::endl;
+    std::cout << "  Metadynamics - Enhanced Sampling Guide" << std::endl;
+    std::cout << "===============================================================" << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "OVERVIEW" << std::endl;
+    std::cout << "  Metadynamics adds a history-dependent bias potential during MD" << std::endl;
+    std::cout << "  simulation, pushing the system away from already-visited regions" << std::endl;
+    std::cout << "  of conformational space. This accelerates the exploration of new" << std::endl;
+    std::cout << "  conformers and free energy surfaces." << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "TWO MODES" << std::endl;
+    std::cout << "  1. Internal RMSD-MTD (recommended for conformational sampling):" << std::endl;
+    std::cout << "       curcuma -md input.xyz -rmsd_mtd true -rmsd_mtd_ref_file refs.xyz" << std::endl;
+    std::cout << "     Built-in bias based on RMSD from reference structures." << std::endl;
+    std::cout << "     No external dependencies." << std::endl;
+    std::cout << std::endl;
+    std::cout << "  2. PLUMED-based (advanced collective variables):" << std::endl;
+    std::cout << "       curcuma -md input.xyz -mtd true -plumed_file plumed.dat" << std::endl;
+    std::cout << "     Full PLUMED2 collective variables and bias potentials." << std::endl;
+    std::cout << "     Requires PLUMED2 library (--enable-plumed at build time)." << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "QUICK START" << std::endl;
+    std::cout << "  # Minimal RMSD-MTD (bias away from reference structure):" << std::endl;
+    std::cout << "  curcuma -md input.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -rmsd_mtd true -rmsd_mtd_ref_file ref.xyz" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # With well-tempered bias (adaptive deposition):" << std::endl;
+    std::cout << "  curcuma -md input.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -rmsd_mtd true -rmsd_mtd_ref_file ref.xyz \\" << std::endl;
+    std::cout << "      -wtmtd true -rmsd_mtd_dt 500" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # PLUMED metadynamics:" << std::endl;
+    std::cout << "  curcuma -md input.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -mtd true -plumed_file plumed.dat" << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "RMSD-MTD PARAMETERS" << std::endl;
+    std::cout << "  -rmsd_mtd <bool>            Enable internal RMSD-based metadynamics" << std::endl;
+    std::cout << "                              (default: false)" << std::endl;
+    std::cout << "  -rmsd_mtd_ref_file <string> Reference structure file (required for" << std::endl;
+    std::cout << "                              -rmsd_mtd). Can contain multiple structures." << std::endl;
+    std::cout << "  -rmsd_mtd_k <double>        Force constant for RMSD bias (default: 0.1)" << std::endl;
+    std::cout << "                              Controls bias strength. Start with 0.01-0.1." << std::endl;
+    std::cout << "  -rmsd_mtd_alpha <double>     Gaussian width in RMSD^2 (default: 10)" << std::endl;
+    std::cout << "                              Smaller = narrower Gaussians = finer resolution." << std::endl;
+    std::cout << "  -rmsd_mtd_pace <int>         Add bias every N MD steps (default: 1)" << std::endl;
+    std::cout << "                              Increase for less frequent deposition (e.g. 10-100)." << std::endl;
+    std::cout << "  -rmsd_mtd_max_gaussians <int> Max stored bias structures (default: -1 = unlimited)" << std::endl;
+    std::cout << "  -rmsd_mtd_atoms <string>     Atom indices for RMSD (default: all, \"-1\")" << std::endl;
+    std::cout << "  -wtmtd <bool>               Enable well-tempered metadynamics (default: false)" << std::endl;
+    std::cout << "  -rmsd_mtd_dt <double>        Bias factor for well-tempered MTD (default: 1e6)" << std::endl;
+    std::cout << "                              Only used when -wtmtd true." << std::endl;
+    std::cout << "                              Lower values = stronger adaptive rescaling." << std::endl;
+    std::cout << "                              Typical: 10-1000." << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "WELL-TEMPERED MTD" << std::endl;
+    std::cout << "  In standard MTD, Gaussians are added with constant height, leading to" << std::endl;
+    std::cout << "  over-filling. Well-tempered MTD (-wtmtd true) rescales the Gaussian" << std::endl;
+    std::cout << "  height by exp(-V / kT*DT), where DT is the bias factor (-rmsd_mtd_dt)." << std::endl;
+    std::cout << "  This converges to the free energy surface as F(RMSD) = -DT * c(RMSD)." << std::endl;
+    std::cout << std::endl;
+    std::cout << "  Practical guidance:" << std::endl;
+    std::cout << "    - Start with -rmsd_mtd_dt 100-1000 for typical organic molecules" << std::endl;
+    std::cout << "    - Lower DT = stronger rescaling = faster convergence but less exploration" << std::endl;
+    std::cout << "    - Always combine with -rmsd_mtd true" << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "OUTPUT FILES" << std::endl;
+    std::cout << "  When BMT output is active (default):" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/                      BMT root directory" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/input.trj.xyz          MD trajectory" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/Basename.rmsd_mtd/     COLVAR subdirectory" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/Basename.rmsd_mtd/COLVAR_0" << std::endl;
+    std::cout << "                                              Collective variable log" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/Basename.rmsd_mtd/COLVAR_N" << std::endl;
+    std::cout << "                                              Per-reference COLVAR files" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/input.topo.json        GFN-FF topology cache" << std::endl;
+    std::cout << "    input.md.TIMESTAMP/curcuma_citations.bib  Citation references" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  With -no_bmt, files are written to the current working directory." << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "EXAMPLES" << std::endl;
+    std::cout << "  # 1. Simple RMSD-MTD (bias away from starting structure):" << std::endl;
+    std::cout << "  curcuma -md ethanol.xyz -method gfnff -temp 300 -steps 10000 \\" << std::endl;
+    std::cout << "      -rmsd_mtd true -rmsd_mtd_ref_file ethanol.xyz" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # 2. Well-tempered RMSD-MTD:" << std::endl;
+    std::cout << "  curcuma -md ethanol.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -rmsd_mtd true -rmsd_mtd_ref_file ethanol.xyz \\" << std::endl;
+    std::cout << "      -wtmtd true -rmsd_mtd_dt 500" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # 3. Multi-reference MTD (bias away from several conformers):" << std::endl;
+    std::cout << "  curcuma -md ethanol.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -rmsd_mtd true -rmsd_mtd_ref_file conformers.xyz \\" << std::endl;
+    std::cout << "      -rmsd_mtd_k 0.05 -rmsd_mtd_alpha 5.0" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # 4. PLUMED metadynamics:" << std::endl;
+    std::cout << "  curcuma -md ethanol.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -mtd true -plumed_file plumed.dat" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # 5. MTD with custom atom selection (only heavy atoms):" << std::endl;
+    std::cout << "  curcuma -md ethanol.xyz -method gfnff -temp 300 \\" << std::endl;
+    std::cout << "      -rmsd_mtd true -rmsd_mtd_ref_file ref.xyz \\" << std::endl;
+    std::cout << "      -rmsd_mtd_atoms \"1-2,4-9\"" << std::endl;
+    std::cout << std::endl;
+
+    std::cout << "  For all SimpleMD parameters: curcuma -help-module simplemd" << std::endl;
+    std::cout << "  For PLUMED syntax:              see docs/PLUMED_HELP.md" << std::endl;
+}
 
 void showStructuredHelp(const std::string& category = "") {
     std::cout << "Curcuma - Computational Chemistry Toolkit" << std::endl;
@@ -2012,6 +2136,10 @@ void showStructuredHelp(const std::string& category = "") {
         std::cout << "  curcuma -traj md_output.xyz -stride 10     # Trajectory analysis" << std::endl;
         std::cout << std::endl;
 
+        std::cout << "Topic Guides:" << std::endl;
+        std::cout << "  curcuma -help metadynamics                 # Metadynamics guide (RMSD-MTD & PLUMED)" << std::endl;
+        std::cout << std::endl;
+
         std::cout << "Get detailed help: curcuma -help [category]" << std::endl;
         std::cout << "   Available categories: ";
         bool first = true;
@@ -2020,7 +2148,11 @@ void showStructuredHelp(const std::string& category = "") {
             std::cout << cat;
             first = false;
         }
-        std::cout << std::endl;
+        std::cout << ", metadynamics" << std::endl;
+
+    } else if (category == "metadynamics") {
+        // Claude Generated (June 2026): Topic-based help for metadynamics
+        printMetadynamicsHelp();
 
     } else {
         // Enhanced category-specific help
@@ -2071,6 +2203,7 @@ void showStructuredHelp(const std::string& category = "") {
             } else if (category == "dynamics") {
                 std::cout << "Dynamics Examples:" << std::endl;
                 std::cout << "  curcuma -md system.xyz -temperature 300 -steps 10000" << std::endl;
+                std::cout << "  curcuma -md system.xyz -rmsd_mtd true -rmsd_mtd_ref_file refs.xyz" << std::endl;
                 std::cout << "  curcuma -casino polymer.vtf -move_type mixed -adaptive_step true" << std::endl;
             } else if (category == "optimization") {
                 std::cout << "Optimization Examples:" << std::endl;
@@ -2088,6 +2221,7 @@ void showStructuredHelp(const std::string& category = "") {
             for (const auto& [name, info] : CAPABILITY_REGISTRY) {
                 available_categories.insert(info.category);
             }
+            available_categories.insert("metadynamics");
 
             bool first = true;
             for (const auto& cat : available_categories) {

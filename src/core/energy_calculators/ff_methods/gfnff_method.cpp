@@ -2883,7 +2883,14 @@ bool GFNFF::initializeForceField()
         } else {
             std::string geom_file = m_parameters["geometry_file"].get<std::string>();
             size_t dot = geom_file.find_last_of('.');
-            std::string topo_file = (dot != std::string::npos ? geom_file.substr(0, dot) : geom_file) + ".topo.json";
+            std::string topo_basename = (dot != std::string::npos ? geom_file.substr(0, dot) : geom_file);
+            // Claude Generated (June 2026): Route .topo.json into BMT directory when output_dir is set
+            std::string topo_file;
+            if (m_parameters.contains("output_dir") && m_parameters["output_dir"].is_string() && !m_parameters["output_dir"].get<std::string>().empty()) {
+                topo_file = m_parameters["output_dir"].get<std::string>() + "/" + topo_basename.substr(topo_basename.find_last_of('/') + 1) + ".topo.json";
+            } else {
+                topo_file = topo_basename + ".topo.json";
+            }
 
             json topo_export = exportTopology();
             topo_export["fingerprint"] = computeTopologyFingerprint();
@@ -8716,7 +8723,14 @@ GFNFF::TopologyInfo GFNFF::calculateTopologyInfo() const
         if (m_cache_topology && m_parameters.contains("geometry_file")) {
             std::string geom_file = m_parameters["geometry_file"].get<std::string>();
             size_t dot = geom_file.find_last_of('.');
-            std::string topo_file = (dot != std::string::npos ? geom_file.substr(0, dot) : geom_file) + ".topo.json";
+            std::string topo_basename = (dot != std::string::npos ? geom_file.substr(0, dot) : geom_file);
+            // Claude Generated (June 2026): Route .topo.json into BMT directory when output_dir is set
+            std::string topo_file;
+            if (m_parameters.contains("output_dir") && m_parameters["output_dir"].is_string() && !m_parameters["output_dir"].get<std::string>().empty()) {
+                topo_file = m_parameters["output_dir"].get<std::string>() + "/" + topo_basename.substr(topo_basename.find_last_of('/') + 1) + ".topo.json";
+            } else {
+                topo_file = topo_basename + ".topo.json";
+            }
 
             std::ifstream topo_in(topo_file);
             if (topo_in.good()) {
@@ -11032,7 +11046,10 @@ Matrix GFNFF::NumGradFixedCharges(double dx)
 
             // Update geometry AND recalculate CN (but NOT EEQ charges)
             // distributeD3CN must also be called so bond r0 = (r0_base + cnfak*CN)*ff updates correctly
+            // Must also recompute shared distances so non-bonded terms use perturbed geometry
             m_forcefield->UpdateGeometry(m_geometry_bohr);
+            computeSharedDistances();
+            m_forcefield->setSharedDistances(&m_shared_srab, &m_shared_sqrab);
             auto cn_vec_plus = CNCalculator::calculateGFNFFCN(m_atoms, m_geometry_bohr);
             Vector cn_plus = Vector::Map(cn_vec_plus.data(), cn_vec_plus.size()).eval();
             m_forcefield->distributeCNOnly(cn_plus);
@@ -11043,6 +11060,8 @@ Matrix GFNFF::NumGradFixedCharges(double dx)
             m_geometry_bohr(i, dim) -= 2 * dx;
             m_geometry(i, dim) = m_geometry_bohr(i, dim) * BOHR_TO_ANGSTROM;
             m_forcefield->UpdateGeometry(m_geometry_bohr);
+            computeSharedDistances();
+            m_forcefield->setSharedDistances(&m_shared_srab, &m_shared_sqrab);
             auto cn_vec_minus = CNCalculator::calculateGFNFFCN(m_atoms, m_geometry_bohr);
             Vector cn_minus = Vector::Map(cn_vec_minus.data(), cn_vec_minus.size()).eval();
             m_forcefield->distributeCNOnly(cn_minus);
@@ -11058,8 +11077,10 @@ Matrix GFNFF::NumGradFixedCharges(double dx)
         }
     }
 
-    // Restore ForceField geometry and CN
+    // Restore ForceField geometry, shared distances, and CN
     m_forcefield->UpdateGeometry(original_geometry_bohr);
+    computeSharedDistances();
+    m_forcefield->setSharedDistances(&m_shared_srab, &m_shared_sqrab);
     auto cn_vec_orig = CNCalculator::calculateGFNFFCN(m_atoms, original_geometry_bohr);
     Vector cn_orig = Vector::Map(cn_vec_orig.data(), cn_vec_orig.size()).eval();
     m_forcefield->distributeCNOnly(cn_orig);
