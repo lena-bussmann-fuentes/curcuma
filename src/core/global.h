@@ -26,10 +26,14 @@
 #include <stdexcept>
 #include <string>
 
+// Claude Generated (March 2026): BLAS/LAPACK config must be included BEFORE Eigen headers
+// This enables EIGEN_USE_BLAS/EIGEN_USE_LAPACKE optimizations for native QM methods
+#include "src/global_config.h"
+#include "src/core/curcuma_eigen_config.h"
+
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
-#include "src/global_config.h"
 #include "src/version.h"
 
 #include "json.hpp"
@@ -81,11 +85,15 @@ struct Mol {
     std::vector<std::pair<int, int>> m_bonds;
     std::vector<int> m_atoms;
 
+    // Claude Generated: Persistent Topology Matrix support
+    Matrix m_topology;
+    bool m_has_topology = false;
+
     // Claude Generated: Periodic Boundary Conditions data
     Eigen::Matrix3d m_unit_cell = Eigen::Matrix3d::Zero(); // 3x3 lattice vectors matrix (Angstroms)
     bool m_has_pbc = false; // PBC active flag
 
-    int AtomCount()
+    int AtomCount() const
     {
         return m_number_atoms;
     }
@@ -184,9 +192,12 @@ inline T Json2KeyWord(const json& controller, std::string name)
     T temp;
     bool found = false;
     transform(name.begin(), name.end(), name.begin(), ::tolower);
+    // Claude Generated (Jun 2026): canonicalize hyphens to underscores for key matching
+    name.erase(std::remove(name.begin(), name.end(), '-'), name.end());
     for (auto& el : controller.items()) {
         std::string key = el.key();
         transform(key.begin(), key.end(), key.begin(), ::tolower);
+        key.erase(std::remove(key.begin(), key.end(), '-'), key.end());
         if (key.compare(name) == 0) {
             temp = el.value();
             found = true;
@@ -205,9 +216,11 @@ inline json MergeJson(const json& reference, const json& patch)
         bool found = false;
         std::string outer = object.key();
         transform(outer.begin(), outer.end(), outer.begin(), ::tolower);
+        outer.erase(std::remove(outer.begin(), outer.end(), '-'), outer.end());
         for (const auto& local : reference.items()) {
             std::string inner = local.key();
             transform(inner.begin(), inner.end(), inner.begin(), ::tolower);
+            inner.erase(std::remove(inner.begin(), inner.end(), '-'), inner.end());
             if (outer.compare(inner) == 0) {
                 result[local.key()] = object.value();
                 found = true;
@@ -262,7 +275,6 @@ inline double angstrom_to_bohr(double ang) { return ang / CURCUMA_BOHR_TO_ANGSTR
 #include <chrono>
 #include <fmt/color.h>
 #include <fmt/format.h>
-#include <unistd.h>
 
 /**
  * @brief Curcuma Logging System - Claude Generated

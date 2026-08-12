@@ -103,6 +103,7 @@ Every new method or capability added by AI must include in its CLAUDE.md:
 - Implement timing analysis for complex functions
 - Keep track of significant improvements in AIChangelog.md, one line per fact
 - **Complex Architecture Documentation**: Factory patterns, dispatchers, and multi-step workflows require comprehensive inline documentation following ARCHITECTURE_DOCUMENTATION.md standards
+- **BMT output compatibility (MANDATORY)**: Every capability that writes output files MUST route them through `outputPath()` (CurcumaMethod subclasses) or `BMTUtils::outputPath()` (standalone handlers). Hardcoded CWD paths are not permitted. Verify with `-no_bmt` (legacy) and default BMT mode before merging.
 - **No UTF symbols in terminal output**: Do not use Unicode box-drawing characters, emoji, arrows (->), checkmarks, or any non-ASCII symbols in fmt::print/std::cout output. Use plain ASCII only. Reason: breaks output in many terminal emulators, log files, and remote shells. CurcumaLogger colored output is exempt (uses ANSI codes, not Unicode).
 
 #### Parameter Definition Standards (MANDATORY for new capabilities)
@@ -136,10 +137,31 @@ Every new method or capability added by AI must include in its CLAUDE.md:
 ## Current Capabilities
 
 ### 1. Quantum Mechanical Methods
-- **Extended Hückel Theory (EHT)** - Semi-empirical quantum chemistry
-- **TBLite Interface** - Tight-binding DFT methods (GFN1, GFN2, iPEA1)
+
+#### Native Implementations (Educational, No External Dependencies)
+
+> ⚠️ **All native QM methods are AI-implemented and machine-tested only — not human production tested.**
+> Results should be validated against external references (TBLite, Ulysses, XTB) before use in research.
+
+- ⚠️ **Extended Hückel Theory (EHT)** - AI-implemented, machine-tested
+- ⚠️ **GFN2-xTB (Native)** - AI-implemented, machine-tested; canonical `gfn2` backend; `-opt` works; Broyden SCF default (`-scf_mode diis|plain|level-shift`, `-scf_guess h0|eeq`); 11/12 sqm_reference @1e-8 vs tblite (only 231-atom `complex` open) — [docs/SQM_VALIDATION.md](docs/SQM_VALIDATION.md), [docs/SCF_MODES.md](docs/SCF_MODES.md)
+  - **d-shell support (X-I1, June 2026)**: S/P/Cl/Si/… (main-group d) now compute via the cartesian→spherical transform, ≤1e-8 Eh vs tblite. CPU + **CUDA GPU** (validated on a GTX 1660: energy bit-identical to CPU, gradient ~1e-16) + **ROCm GPU** (B6 port, validated on a Radeon 890M/gfx1150: energy bit-identical to CPU at 8 dp, `-opt` tracks the CPU trajectory); **Vulkan d still falls back to CPU** (GLSL shaders pending). Transition metals enabled but **unvalidated**. See [docs/SQM_DSHELL_WP.md](docs/SQM_DSHELL_WP.md)
+  - **Threading**: intra-molecule `-threads N` (setup 4×, gradient 3.6×); eigensolve capped at 8 threads (`CURCUMA_EIG_MAX_THREADS`) — [docs/SQM_THREADING.md](docs/SQM_THREADING.md)
+  - **Integral setup** (Jul 2026): shell-pair-blocked overlap/multipole/gradient kernels — setup 209→91 ms, gfn2 total 1199→1083 ms on complex/231 — [docs/SQM_PERFORMANCE.md](docs/SQM_PERFORMANCE.md)
+  - **Integral numerics caveat**: those kernels are algebraically exact but ~1 ulp off the old values (GCC FMA contraction); energies bit-identical, gradients ≤1.7e-14 Eh/Bohr
+  - **Eigensolvers**: opt-in `-eigensolver native|purify|lobpcg`, `CURCUMA_EIG_TRED2=blocked` (MKL-free / GPU-portable) — [docs/SQM_EIGENSOLVE_GPU.md](docs/SQM_EIGENSOLVE_GPU.md)
+  - **Large systems**: `-large_system_mode fragments|dc|sparse` scales SCF past ~1000 atoms — [docs/SQM_LARGE_SYSTEMS.md](docs/SQM_LARGE_SYSTEMS.md)
+  - **SCF extrapolation**: `-scf_extrapolation aspc|gauss` cuts SCF iters in opt/MD (caffeine gfn2 215→90); experimental `xlbomd` = extended-Lagrangian MD — [docs/SQM_SCF_EXTRAPOLATION.md](docs/SQM_SCF_EXTRAPOLATION.md)
+  - **GPU backends** (`-gpu cuda|rocm|vulkan|auto`): all three device-resident through `-opt`/`-md`; ROCm has FP32 mixed-precision ON by default (real win), Vulkan is opt-in only (eigensolve-bound, no speedup). Detail in [docs/SQM_GPU.md](docs/SQM_GPU.md) / [docs/SQM_ROCM.md](docs/SQM_ROCM.md) / [docs/SQM_VULKAN.md](docs/SQM_VULKAN.md); roadmap in [docs/SQM_GPU_ROADMAP.md](docs/SQM_GPU_ROADMAP.md)
+  - **CUDA is a runtime `dlopen` plugin** (`libcurcuma_cuda.so`, Jul 2026): the main binary is CUDA-free so CPU-only runs start in ~9 ms (was ~50 ms — cuBLAS/cuSOLVER DT_INIT); `-gpu cuda` loads it lazily. See [docs/GPU_PLUGIN_STARTUP.md](docs/GPU_PLUGIN_STARTUP.md)
+- ⚠️ **GFN1-xTB (Native)** - AI-implemented, machine-tested; canonical `gfn1` backend; `-opt` works; Broyden SCF default; 10/12 sqm_reference @1e-8 vs tblite (He2 + `complex` remain) — [docs/SQM_WP2_gfn1_accuracy.md](docs/SQM_WP2_gfn1_accuracy.md)
+- ⚠️ **PM3/AM1/MNDO (Native NDDO)** - AI-implemented, machine-tested; 21/21 tests vs Ulysses reference (< 4 µEh)
+- ⚠️ **Native GFN-FF** - AI-implemented, machine-tested; see [docs/GFNFF_STATUS.md](docs/GFNFF_STATUS.md); S30L vs xtb 6.6.1 (Jul 2026): 28/30 within ~1.5 kcal/mol after F1/F2/CLI/F3/ipis fixes (MAD 433→1.38); residuals: 23 (.CHRG quirk), 27/28+7/8 (torsion), 30/AB (bond) — see [docs/S30L_GFNNF_VALIDATION.md](docs/S30L_GFNNF_VALIDATION.md)
+
+#### External Interfaces (Production Quality, Requires Compilation)
+- **TBLite Interface** - Tight-binding DFT methods (GFN1, GFN2, iPEA1) + **Solvation** (CPCM, GB, ALPB)
 - **XTB Interface** - Extended tight-binding methods (GFN-FF, GFN1, GFN2)
-- **Ulysses Interface** - Various semi-empirical methods (PM3, AM1, MNDO, etc.)
+- **Ulysses Interface** - Semi-empirical methods (PM3, PM6, AM1, MNDO, RM1, etc.) + **Solvation** (GBSA)
 - **Native GFN-FF** - Curcuma's own implementation (`gfnff`) - ✅ **IMPLEMENTED**
 
 ### 2. Force Field Methods
@@ -148,36 +170,65 @@ Every new method or capability added by AI must include in its CLAUDE.md:
 - **QMDFF** - Quantum Mechanically Derived Force Fields
 - **Universal Parameter Caching** - Automatic save/load for all FF methods
 
-### 3. Dispersion and Non-Covalent Corrections
+### 3. Solvation Models (Implicit Solvent)
+- ✅ **TBLite Solvation** - CPCM, GB (Generalized Born), ALPB for GFN methods
+- ✅ **Ulysses Solvation** - GBSA (Generalized Born + SA) for GFN/MNDO methods
+- ⚠️ **Native GFN1/GFN2 ALPB + GBSA** (June 2026, AI/machine-tested) - self-consistent
+  ALPB (`-xtb.solvent_model alpb`, P16 kernel) and GBSA (`-xtb.solvent_model gbsa`, Still kernel)
+  in the native xTB SCF, matching tblite total ΔG (Born + CDS + shift; CM5 for gfn1) to
+  ≤1e-8 Eh on the validation set (CPU + GPU); `-method gfn2 -xtb.solvent water -xtb.solvent_model gbsa`
+  (legacy numeric codes 3/2 still accepted). CPCM native solvation still pending.
+  See [docs/SQM_SOLVATION_WP.md](docs/SQM_SOLVATION_WP.md)
+- ⚠️ **Native GFN-FF ALPB** (June 2026, AI/machine-tested) - self-consistent: the Born
+  reaction field couples into the EEQ solve (`A_eeq += B`), so charges polarize in the solvent.
+  `-method gfnff -gfnff.solvent water -gfnff.solvent_model alpb` matches **xtb 6.7.1** (`--gfnff
+  --alpb`) to **≤1e-8 Eh** (7 mol × 4 solvents); analytic gradient FD-validated. GFN-FF has
+  no separate GBSA (reference uses ALPB), so `-gfnff.solvent_model gbsa` maps to ALPB. See
+  [docs/SQM_SOLVATION_WP.md](docs/SQM_SOLVATION_WP.md) WP5
+- **25+ Solvents** - water, methanol, DMSO, acetone, benzene, etc.
+- **Auto-Activation** - Specify `-solvent water` to enable
+- **Documentation** - See [docs/SOLVATION.md](docs/SOLVATION.md) for details
+
+### 4. Dispersion and Non-Covalent Corrections
 - **DFT-D3** - Grimme's D3 dispersion correction
-- **DFT-D4** - Next-generation D4 dispersion correction  
+- **DFT-D4** - Next-generation D4 dispersion correction
 - **H4 Correction** - Hydrogen bonding and halogen bonding corrections
 
-### 4. Geometry Optimization
+### 5. Geometry Optimization
 - **LBFGS Optimizer** - Limited-memory Broyden-Fletcher-Goldfarb-Shanno
 - **Multiple Convergence Criteria** - Energy, gradient, RMSD-based
 - **Constrained Optimization** - Distance, angle, and dihedral constraints
 
-### 5. Conformational Analysis ✅ REFACTORED 2025
-- **ConfSearch** - Systematic conformational searching (unified trajectory framework)
+### 6. Conformational Analysis ✅ REFACTORED 2025
+- **ConfSearch** - Systematic conformational searching (unified trajectory framework); supports **dual-method** runs (`-md_method` explore + pre-opt, `-opt_method` refine + rank; both fall back to `-method`) — see [docs/CONFSEARCH_DUAL_METHOD.md](docs/CONFSEARCH_DUAL_METHOD.md); **restartable** via `-restart` (self-contained checkpoint: bias pool + cumulative + seeds + schedule, written to CWD + BMT) — see [docs/CONFSEARCH_RESTART.md](docs/CONFSEARCH_RESTART.md); **registry-backed since Jul 2026** (67 PARAMs) so its flags are no longer auto-routed away, and every child computation (MD / 4 opt sites / 2 ConfScan passes) shares one `ChildConfig()` carrying charge, spin, gpu and the method sub-scopes; **RMSD-MTD bias speedup (Jul 2026)**: a rigorous Gaussian-cutoff screen (`-rmsd_mtd_screen`, default ON, physics-preserving) skips far hills before the Kabsch, plus an enforced pool cap (`-rmsd_mtd_max_gaussians`) — see [docs/CONFSEARCH_MTD_SCREEN.md](docs/CONFSEARCH_MTD_SCREEN.md)
 - **ConfScan** - Conformational scanning along reaction coordinates
 - **RMSD Analysis** - Structure comparison and alignment
 - **Energy-based Filtering** - Automatic conformer ranking
 - **Refactored Geometry Commands** - TrajectoryWriter for JSON format (Phase 5)
 
-### 6. Molecular Dynamics
+### 7. Molecular Dynamics
 - **SimpleMD** - Basic molecular dynamics simulation
+- ⚠️ **Temperature ramps / live T / thermal regions** (Jun 2026, AI/machine-tested) - `setTargetTemperature()` live setpoint; multi-stage `temp_ramp`/`temp_schedule` (`steps`/`reach` modes); per-atom-subset `temp_regions` (Berendsen/CSVR/Andersen; NH falls back to global). No-region path byte-identical to legacy. See [docs/TEMPERATURE_RAMP.md](docs/TEMPERATURE_RAMP.md)
 - **NEB Docking** - Nudged elastic band for transition states
 - **Trajectory Analysis** - Analysis of MD trajectories
+- **PLUMED Metadynamics** - Enhanced sampling via PLUMED2 plugin (`-mtd` flag) — see [docs/PLUMED_HELP.md](docs/PLUMED_HELP.md)
 
-### 7. Analysis Tools
+### 8. Analysis Tools
 - **✅ Parallel Analysis** - Frame-level parallelization with CxxThreadPool (3-8x speedup, January 2026)
+
+### 9. Output Directory System
+- **🤖 BMT (Basename.Method.Timestamp)** - Default output directory for all commands — see `src/tools/CLAUDE.md`
+- **`-bak` flag** - Copy specified files from BMT directory back to CWD
+- **`-no_bmt`** - Disable BMT, write output to CWD (legacy behavior)
 - **✅ TrajectoryWriter** - Unified output system for Human/CSV/JSON/DAT formats
 - **✅ Scattering Analysis** - P(q)/S(q) with logarithmic q-spacing and automatic gnuplot visualization (2026)
 - **RMSD Calculations** - Root-mean-square deviation analysis
 - **Persistent Diagram** - Topological data analysis
 - **Hessian Analysis** - Second derivative calculations
 - **Orbital Analysis** - Molecular orbital visualization and analysis
+
+### 10. Core Computational Libraries
+- ✅ **MNDO Integrals** - Dewar-Thiel multipole expansion for semi-empirical 2e⁻ integrals, see [docs/MNDO_INTEGRALS.md](docs/MNDO_INTEGRALS.md)
 
 ## Architecture
 
@@ -190,7 +241,7 @@ Every new method or capability added by AI must include in its CLAUDE.md:
 - **Polymorphic Design**: Single `ComputationalMethod` interface for all QM/MM methods
 - **MethodFactory**: Priority-based method resolution with hierarchical fallbacks
 - **Unified Interface**: `calculateEnergy()`, `getGradient()`, consistent API across all methods
-- **Method Priority System**: `gfn2` → TBLite > Ulysses > XTB (automatic fallback)
+- **Method Priority System**: `gfn2`/`gfn1` → Native xTB (AP3); `ipea1` → TBLite; `ugfn2` → Ulysses
 - **Thread-Safe**: Full multi-threading support maintained
 - **Universal Verbosity**: Consistent output control across all computational methods
 
@@ -202,11 +253,13 @@ std::unique_ptr<ComputationalMethod> method =
 double energy = method->calculateEnergy();
 ```
 
-##### **Supported Method Hierarchies**
-- **gfn2**: TBLite → Ulysses → XTB (automatic priority resolution)
-- **gfn1**: TBLite → XTB → Ulysses
-- **uff**: ForceField wrapper with parameter generation
-- **eht**: Extended Hückel Theory (native implementation)
+##### **Supported Method Hierarchies** (AP3, April 2026)
+- **gfn1/gfn2**: Native curcuma xTB (canonical); `ipea1`/`ugfn2` for other providers
+- **xtb-gfn1/xtb-gfn2**: External GFN — TBLite (USE_TBLITE) → XTB binary (USE_XTB), like `xtb-gfnff`
+- **tblite-gfn1/tblite-gfn2**: TBLite explicitly (forces that backend)
+- **eht**: Native only (always available, no dependencies)
+- **pm3**: Native only (H, C, N, O supported, no dependencies)
+- **uff/qmdff**: ForceField wrapper with parameter generation
 - **gfnff**: Native C++ GFN-FF (always available, ✅ **COMPLETE**)
 - **xtb-gfnff**: Fortran/XTB GFN-FF — ExternalGFNFF (USE_GFNFF) → XTB (USE_XTB)
 
@@ -279,22 +332,13 @@ curcuma/
 └── CMakeLists.txt           # Build configuration
 ```
 
-## Completed Developments (2025-2026)
+## Completed Developments (2026)
 
-✅ **Platform-Independent External Dependency Discovery** - Phase 2a+2b complete: Plumed2 via find_library(), D4 via find_package(LAPACK), both with fallback support, portable across Linux/macOS/Windows
-✅ **External Dependency Conditional Compilation** - Phase 1b complete: D3/D4 guards in QMDFF/UFF/ForceField, MethodFactory runtime checks, all 14 external libs properly gated
-✅ **Parameter Registry System** - Macro-based parameter definitions, auto-help, type validation
-✅ **ConfigManager Layer** - Type-safe parameter access, hierarchical dot notation
-✅ **EnergyCalculator Refactoring** - Polymorphic interface, priority-based method resolution
-✅ **Universal Verbosity System** - Consistent 4-level output across all methods (0-3)
-✅ **Method Hierarchies** - `gfn2` auto-falls back: TBLite → Ulysses → XTB
-✅ **Physical Architecture** - QM/MM methods organized under `src/core/energy_calculators/`
-✅ **Topological Data Analysis** - dMatrix legacy functionality integrated as TDAEngine
-✅ **Parameter Routing Fix** - Multi-module parameter hierarchies now work (json null-error fixed)
-✅ **GFN-FF Implementation** - Complete and operational in ff_methods/ - See [docs/GFNFF_STATUS.md](docs/GFNFF_STATUS.md)
-✅ **GFN-FF Full Implementation** (2025-2026) - All energy terms, gradients, EEQ charges, D4 dispersion; sub-mEh accuracy on most molecules - See [docs/GFNFF_STATUS.md](docs/GFNFF_STATUS.md)
-✅ **Scattering Analysis Enhancements** (January 2026) - Logarithmic q-spacing (default), automatic gnuplot script generation with 4-panel plots
-✅ **Analysis Parallelization** (January 2026) - Frame-level parallelization with CxxThreadPool, 3-8x speedup for trajectory analysis
+> Older 2025 work (parameter registry, polymorphic EnergyCalculator, native GFN2/GFN1/PM3, MNDO integrals, GFN-FF full implementation, scattering, analysis parallelization, dependency gating) is in `AIChangelog.md` + git history.
+
+✅ **`-interaction` capability** (June 2026) - supramolecular interaction energy `E(AB)−E(A)−E(B)` for the S30L host-guest set; modes: S30L A/B/AB dir (+`.CHRG`), batch vs `reference_s30l` (MAD/RMSD), explicit `-fragA/-fragB`, single-AB auto-split
+✅ **GFN-FF aromatic ring torsions fixed** (June 2026) - acyclic-only pi-sp3 rules were wrongly applied to ring torsions; gated on `!in_ring`; S30L host A now bit-identical to Fortran, validation 18/18 — see [docs/GFNFF_STATUS.md](docs/GFNFF_STATUS.md)
+✅ **GFN-FF GPU HB-freeze resolved + per-frame gradient diagnostic** (June 2026) - the GPU HB-charge freeze is correct (matches CPU+Fortran); `test_gfnff_grad_traj` is the clean force metric (MD heat-exchange is not) — see [docs/GPU_GFNNF_DISCREPANCIES.md](docs/GPU_GFNNF_DISCREPANCIES.md)
 
 ## Build and Test Commands
 
@@ -330,6 +374,7 @@ ctest -R "cli_rmsd_01" --verbose
 - **Prioritized TODO List**: See [TODO.md](TODO.md)
 - **Module Docs**: Each `src/` subdirectory has CLAUDE.md with specific tasks
 - **GFN-FF Status**: See [docs/GFNFF_STATUS.md](docs/GFNFF_STATUS.md) for implementation details
+- **Technical Debt**: Identified debt in GFN-FF / native xTB / QM interfaces / EnergyCalculator / RMSD-alignment API — [docs/TECHNICAL_DEBT.md](docs/TECHNICAL_DEBT.md)
 
 ## Workflow States
 - **ADD**: Features to be added
@@ -427,5 +472,13 @@ ctest -R "cli_rmsd_01" --verbose
 
 1. **GFN-FF Limitations**: See [docs/GFNFF_STATUS.md](docs/GFNFF_STATUS.md#known-limitations) for details (D4 dispersion, EEQ integration, metal parameters)
 
-2. **Unit migration**: Some legacy code still uses hardcoded constants instead of CurcumaUnit functions
+2. **GFN-FF S30L validation (Jul 2026, AI/machine-tested)**: see [docs/S30L_GFNNF_VALIDATION.md](docs/S30L_GFNNF_VALIDATION.md) — vs xtb 6.6.1: 28/30 within ~1.5 kcal/mol (MAD 433→1.38). Fixed: (a) charged complexes (23-30) EEQ qfrag=[0,0] → xtb-style both-assignment trial (F2); (b) `-charge -N` parsed as +N → negative-number CLI fix; (c) `AngleBending` 1/sinθ NaN guard (F1); (d) F2 cache bug — inline topo-cache load dropped qfrag (cached charged nfrag==2 re-runs neutralised Coulomb; now restores qfrag, write guard checks SUM); (e) F3 bond/Hückel/Coulomb — S CN=2 sp2→sp3 (11/12), halogen hyb + hoffdiag default 0 + π-system membership aligned to xtb (F/Cl in, Br/I out), `metal_type[86]` array had 83 entries (Kr/I/Xe missing → I read as TM → dgam ff=-0.9 not -0.07 → 15/16 Coulomb -14 kcal); array rewritten to xtb metal(86), 15/16 fixed; (f) F3d Hückel ipis — xtb subtracts the π-system charge from nelpi (`nelpi -= ipis`); curcuma didn't → charged hosts had nelpi too large → wrong pibo → bond off; now computes ipis (qheavy + neutralize-fragment + re-EEQ + dqa·1.1) and subtracts; fixed 25/26 (→0.0) and 30/B. Residuals: 23 (.CHRG quirk, curcuma correct), 27/28 + 7/8 (torsion deficit, cur ~80% of xtb), 30/AB (bond pibo, ipis=0). Pre-existing from merge: `cli_curcumaopt_07_opt_multixyz` golden-value drift.
+
+3. **Verbosity scoping across threads (residual)**: the global `CurcumaLogger` verbosity is now RAII-scoped via `CurcumaMethod` (ctor/dtor save-restore), but it is a shared static and cannot be cleanly scoped across `CxxThreadPool` workers — the pool-owning helpers (`PerformMolecularDynamics`/`PerformOptimisation`) and energy-method setup re-assert the level at their boundaries (kept deliberately); a `thread_local` verbosity (the only full fix) is out of scope. See [docs/CONFSEARCH_ROADMAP.md](docs/CONFSEARCH_ROADMAP.md) #1.
+
+4. **ConfSearch Phase A-C**: efficiency/robustness features (RATTLE threshold, topo/Epot abort, seed funnel, opt→bias feedback, permutation-aware + adaptive MTD bias) — roadmap, open TODOs and experimental caveats in [docs/CONFSEARCH_ROADMAP.md](docs/CONFSEARCH_ROADMAP.md). Cross-run bias heating (shared-pool hills `W=k·counter` grow unbounded → `<T>` climbs run-by-run → NaN) is bounded by **defaults ON for ConfSearch**: `rmsd_mtd_freeze_inherited`+`temp_abort` (measured best: 0 blow-ups, best conformer yield; `rmsd_mtd_max_height` is opt-in for tighter T). The bare `-startT 500` run no longer blows up (roadmap TODO #4; intra-run wide-hill blow-up still open).
+
+5. **Native GFN transition metals FIXED (MOR41, Jul 16, 2026, AI/machine-tested)**: three bugs, all in `xtb_native.cpp`/`STO_CGTO.hpp`. (a) `reference_occ`/`p_kcn`/`p_shpoly` are angular-momentum-indexed in tblite but were read by shell index; TMs order shells `[d,s,p]` so this scrambled them (main-group unaffected, ang==pos). GFN2: index by angular momentum. GFN1: same, but valence-aware (its valence+polarisation shells share an l — only H's two s-shells — so occupation goes to the first shell of each l; `p_kcn` stays shell-indexed per tblite gfn1). (b) STO-NG tables stopped at n=5, so 5d metals' 6s/6p shells used wrong Gaussians (~0.1–0.5 Eh); added tblite's dedicated 6s/6p STO-6G arrays. Further fixes closed the residual, all in the overlap/dispersion (electronic params were already exact): (c) **5p STO-4G transcription error** in `STO_CGTO.hpp` (pAlpha4 5p 3rd primitive) corrupted every 5p overlap (I + 4d/5d); (d) **D4 `r4/r2` table truncated at Z≤36** (placeholder 10.0) → heavy-element D4 under-binding; (e) **D3/D4 CN-Gaussian weight-normalization threshold** (`sum_weights>1e-10`) wrongly collapsed C6 for sparse-reference-CN metals → GFN1 D3 heavy-metal under-binding; (f) **missing D4 `sscale` entry** for reference-system Na (refsys=11) in `d4_corrections_data.cpp` → the 4th (high-CN) reference of Sc/Ti/V/Zr/Nb/Hf/Ta had C6 ~2.4× too large (gfn2 PR40/Ti over-binding). **Final: native GFN1 and GFN2 reproduce tblite for ALL 95 MOR41 structures to <1e-6 Eh (95/95 both methods; ~85/95 at the 1e-8 print floor).** MOR41 reaction MAD native-GFN2-vs-xtb **507→0.03 kcal/mol**. No main-group/3d/GFN-FF regression; all energy ctests pass. **Separate/open**: GFN-FF transition metals. The metal `btyp>=5` bond branch **is now implemented** (`53d6aeb`/`14fc648`); with the four-list neighbour port MOR41 GFN-FF per-structure MAD is **7.30** kcal/mol (max **37.80** = ED07, 39/95 within 1). Still open: `btyp=6` (eta) promotion unwired, TM-TM `mchar` attenuation omitted, and **ED07** (largest residual, entirely in the bond term, no eta ligand — unexplained). [docs/GFNFF_METAL_BOND_ANALYSIS.md](docs/GFNFF_METAL_BOND_ANALYSIS.md) is the **pre-fix** diagnostic (flagged superseded). Runner `scripts/mor41_validation.py`, results [docs/MOR41_VALIDATION.md](docs/MOR41_VALIDATION.md).
+
+6. **GFN-FF FT-HMO π-occupation fixes + reference split (Jul 23, 2026, AI/machine-tested)**: two faithful ports in `huckel_solver.cpp` fixed the metal-coordinated aromatic rings — (a) **open-shell `occu` split for odd nelpi** (was closed-shell `nel/2` doubled → lost the odd electron + wrong biradical index; now `ihomoa=nel/2+1`/`ihomob=nel/2`, two `fermismear` passes; even nelpi bit-identical → COT/CB untouched) fixed the 5e Cp rings; (b) **`pisip>0.40` "wrong pi occupation" fallback** (`gfnff_ini.f90:1082`, xtb variant, NOT print-gated, redo `nelpi-1` at et=4000) fixed the 5-atom/7e N-heteroaromatics (ED21/PR16/ED16a: +180→~+2 kcal). Then (c) **carbene itag→FT-HMO** (the `calculatePiBondOrders` call site hard-coded an all-zeros itag → 2-coordinate carbene C mis-counted +1 π-e) and (d) **carbene angle θ0=145°** (`gfnff_ini.f90:1573`, was missing → 5-ring carbene kept θ0=109°) fixed ED16b (organic amidine) −20.9→**0.0000** kcal. Then (e) **halogen-bond B-atom topological filter** (`detectHalogenBondsNative`, `gfnff_method.cpp:9310`) — only excluded B directly bonded to X; Fortran `gfnff_ini.f90:872` needs `bpair(B,X)>3` (B must be A…B, not X-B). S/P/metal donors admitted B atoms 2-3 bonds away → ~11× too many X-bonds (PR34 114/−0.0201 vs ref 22/−0.0018 Eh). Now filters on `topo_info.bpair[X][B]<=3`; PR34 −10.5→+1.0, 31 structures improved. Then (f) **EEQ `gam`/`chi` heavy-element array corruption** (`gfnff_par.h`) — `gam_eeq` was placeholder garbage for **all Z=56-86** (W gam +0.064240 vs Fortran −0.003724) and `chi_eeq` wrong for Z=57-71 (La-Lu); replaced with the verbatim Fortran `*_angewChem2020` arrays. Wrong W hardness → W EEQ charge 0.326 (ref 0.351) → wrong Coulomb + metal-bond fqq. Fixed **every 5d-metal (W/Ir/Pt) at once: ED07 +8.5→+0.09, PR07 +6.7→+0.10, PR22 +2.9→+0.23, ED18/ED22/PR31/…** (14 improved). Then (g) **eta-aware X-bond bpair** (`detectHalogenBondsNative`) — the Fortran `bpair` (nbondmat/pairsbond) needs SYMMETRIC reachability and eta bonds are stored asymmetrically (metal lists the eta-C, eta-C omits the metal), so eta never bridges; curcuma's plain-BFS bpair DID bridge through the eta Ru-C, shortcutting X…B (ED33 P-Ru-C_eta=2 vs ref 5) and dropping the valid far X-bond. The filter now rebuilds the distance on an eta-free adjacency (metal↔itag=−1 edges removed; normal Ru-P/Ru-S kept, PR34 unchanged); ED33 +6.8→+0.45. Then (h) **SP3-specials torsion order** (`gfnff_torsions.cpp`) — the Fortran `gfnff_ini.f90:1746` SP3-specials block (sp3 group5-group5 N-N/P-P/N-P → nrot=3, phi0=60, f1=3.0, raw hyb) comes AFTER and overrides the pi-sp3 case (:1733); curcuma applied it BEFORE its (relocated-to-end) pi-sp3 override, so aminophosphine P-N torsions (N in a pi ring) were reset to phi0=180/f1=0.2 → half the torsion energy. Moved the SP3-specials override after the pi-sp3 block; ED30 −3.44→+0.00, PR30 −3.72→+0.08. Then (i) **bond `fcn` heavy-atom neighbour count** (`gfnff_method.cpp:~4754`, `getGFNFFBondParameters`) — the Fortran heavy-heavy bond weakener `fcn = 1/(1+0.007·nb(20,i)²)/(1+0.007·nb(20,j)²)` (`gfnff_ini.f90:1181-1183`) uses `topo%nb(20,i)`, the **bonded-neighbour COUNT** (slot 20 of the `nb` array holds the degree). curcuma called `countNeighborsWithin20Bohr()` — a literal 20-Bohr distance sphere (~40 atoms in a compact complex) — collapsing fcn to ~0.007 and nuking every **non-metal** heavy-heavy bond (P-P, P-S, S-S, …; metal bonds were unaffected — the metal branch `gfnff_ini.f90:1254-1259` already used the bonded degree via `topo.neighbor_lists`). PR27 has a spurious cis P…P bond (R=2.645 Å, both P on the Ru): its fc was −0.0002 vs reference −0.046, losing −18.5 kcal — the **entire** +17.7 kcal PR27 residual. Now uses `topo.neighbor_lists[atom].size()` (== `nb(20,i)`, consistent with the metal branch); PR27 +17.67→−0.76, P-P bond E −0.00015→−0.02961 Eh (ref −0.02963). Only PR27 changed (sole MOR41 non-metal heavy-heavy bond); 35/35 golden-value ctests byte-identical. Then (j) **FT-HMO π-occupation second-attempt temperature** (`huckel_solver.cpp`) — the "probably wrong pi occupation" fallback (`pisip>0.40` → redo with `nelpi−1`) was re-solving the reduced-electron Hückel Hamiltonian at **et=4000** (the xtb variant); the pprcht/gfnff reference (`gfnff_ini.f90:993`) deliberately uses **et=300** for the second attempt (colder → sharper occupation; only the FIRST solve uses 4000). Wrong et left a systematic ~0.005−0.008 piBO offset on the metal-coordinated N-heteroaromatic fragments, entirely in the bond term (both r0 via `pi_shift` and fc via `fpi` scale with piBO). Threaded an `et` arg through `solveAndBuildDensity` (default 4000, main solve unchanged); the redo passes 300.0. Fallback still always fires (xtb-like, NOT print-gated like pprcht's `if(pr2)` — else the energy would depend on the verbosity flag). piBO now bit-identical (<1e-6) to the reference on these fragments; PR25 +2.87→+0.10, ED25 +2.77→+0.03, PR16 +1.95→−0.00, ED16a +1.02→+0.04, ED21/PR21 +2.3/+2.5→+0.3/+0.5 (the 6 fallback-firing structures; zero regressions). Then (k) **CN neighbour-list cutoff too tight** (`gfnff.h` PARAM `cn_cutoff_bohr` + fallbacks) — the dynamic bond r0 = `(r0_base+cnfak·CN)·ff` needs the reference's CN, and the reference `cnthr` (`gfnff_param.f90:551`, accuracy=1) is **100 Bohr² = 10 Bohr**, but curcuma's default was **6.0 Bohr** — TIGHTER than the reference. Heavy/metal atoms have large covalent radii, so their erf-CN transition extends past 6 Bohr; the tight cutoff truncated real CN contributions. The FFWorkspace energy path (`calculateGFNFFCNWithNeighbors`) uses this cutoff, so its dynamic-r0 CN was wrong (PR23 Ir: CN(P) 3.491 vs correct 3.621 → bond +1.63 kcal). The legacy per-bond thread path uses the full O(N²) `calculateGFNFFCN` and was always correct — that mismatch (FF params right, workspace CN truncated) is how it surfaced. Raised the default to 10.0 (CN converged: 10==20==40); PR23 −4.083676→−4.086275 (analyzer −4.086276, 0.0003 kcal). Then (l) **BATM 1,4-pair test not eta-aware** (`calculateTopologyInfoOnce`, gfnff_method.cpp) — the bonded-ATM triple list is built from 1,4 pairs (`bpair==3`) + neighbours (`gfnff_ini.f90:708`); curcuma tested `bpair` against the plain-BFS `topo_distances`, which bridges through eta Ru-C bonds. Same asymmetric-eta issue as the X-bond bpair (k'): the Fortran `topo%bpair` (nbondmat/pairsbond) needs SYMMETRIC reachability so eta never bridges. The BFS shortcut generated hundreds of spurious triples (PR28 1085 vs reference 656) → BATM over-binding ~1 kcal on the eta complexes (PR26/PR28/PR27/ED33 — the whole remaining residual). Now uses the eta-free adjacency (metal↔itag=−1 edges removed) for the `bpair==3` test; triple counts match exactly (650/656/645/908), the 4 totals match the analyzer to **<0.002 kcal**. Then (m) **torsion periodicity for metal central bonds** (`gfnff_torsions.cpp`) — the Fortran nrot (`gfnff_ini.f90:1730-1744`) is keyed on the central BOND type and pi membership, not raw atom hyb: `nrot=1` default, `=3` if both central atoms hyb==3 (Me case), `=2` if `btyp(m)==2` (pi bond), `=3` if pi-sp3 (the sp2 atom has `piadr>0`). curcuma inferred nrot from hyb_j/hyb_k alone, so metal bonds (btyp=5) were mis-assigned: a TM with 3 neighbours is hyb=2 (`gfnff_ini2.f90:241`), so its M-C(sp3) torsion took the sp2-sp3 branch (nrot=3 + pi-sp3 f1=0.5, half barrier) and its M-C(sp2) torsion took sp2-sp2 (nrot=2) — but a metal atom has piadr=0 and a metal bond is btyp=5≠2, so the reference keeps nrot=1, f1=1.0. Left the torsion term ~0.4-0.56 kcal low (ED40a/PR41/ED14 — Ru/Ti/Ni). Gated the sp2-sp2→nrot=2 branch on `bond_type==2` and the sp2-sp3→nrot=3 periodicity + pi-sp3 f1=0.5 on the sp2 atom being pi; the 3 match the analyzer to <0.001 kcal. Then (n) **misaligned HB basicity/acidity arrays** (`gfnff_par.h`) — `hb_basicity`(xhbas)/`hb_acidity`(xhaci) had 17 zeros instead of 15 on the Ar-Ge (Z18-32) filler row, shifting every later entry by two, so As/Se/Br/Sb/Te/I read the wrong HB params (iodine got hbbas=3.5/hbaci=1.5 instead of 1.9/2.50). Surfaced on ED11 (Pd/I complex): residual entirely in the HB term, the C-H…I(iodide) bond; per-triple dump vs `abhgfnff_eg1` showed rdamp/qhoutl matched but bas/aci didn't → wrong iodine basicity/acidity. Removed the 2 extra zeros; ED11 −0.174→−0.001, PR35 (Se) +0.053→+0.014, organic HB unchanged. vs the **port reference pprcht/gfnff** (built standalone at `external/gfnff`, `-Dbuild_exe=ON`): per-structure MAD **7.27→…→0.023→0.007→0.004** (within-1 52→**95/95**, **all within 0.1 kcal**), **reaction-level MAD 0.008 kcal/mol** (max 0.07); 71/71 runnable gfnff ctests pass, 35/35 golden values unchanged; 3d/4d metals (Z≤55) unchanged. Fixes (i)-(n) are **per-structure** correctness, not reaction-level cancellation. **OPEN PORTING QUESTION — reference split**: the two GFN-FF impls themselves disagree on TMs — **pprcht/gfnff vs xtb 6.7.1 MAD 11.6, max 178 kcal** (PR10/PR04/ED10/…). curcuma now tracks pprcht (its port source) to MAD 1.4; the large "vs-xtb" residual is that divergence, not a curcuma bug. xtb changed TMs since the pprcht snapshot (cf. Moradi et al., JCC 2026, TM xTB extensions). **RESOLVED vs DLPNO-CCSD(T) (Table S1, 41 reactions): pprcht MAD 62.6, curcuma 63.1, xtb 71.7 kcal — pprcht (which curcuma tracks) is closer to the true QM than xtb (6/8 of the most-divergent reactions), so no reason to re-target xtb. But ALL GFN-FF impls are ~60-70 kcal from DLPNO: GFN-FF is a force field, fundamentally unsuitable for MOR41 reaction thermochemistry (a method limitation, not a port bug; GFN2 reaches ~12 MAD).** Pure-port residuals remaining (pprcht==xtb) are all small, all in the **metal-bond term**, and were investigated to the precision floor — **no clean single-parameter fix exists**: the `bond_params` array matches the Fortran `bond_angewChem2020` exactly (Z 1-86, 0 mismatches), and per bond the `fheavy`/`fpi`/`fqq`/`fcn`/`bstrength` factors all match. The residual is a sub-0.005 Å difference in the metal-bond equilibrium r0 = `gfnffrab(CN)` + metal shifts — a CN/geometry-dependent quantity, scattered across element pairs (PR23 Ir: Ir-C 0, Ir-P +0.005, Ir-Cl +0.002, Ir-I +0.001 Å) and below the analyzer's print precision, that accumulates to ED33/PR23/PR35 residuals. This was originally (wrongly) called "irreducible metal-bond r0 fine-precision"; the apples-to-apples egbond decomposition (instrumenting the Fortran energy-time dynamic r0, which differs from the printed setup r0) later proved the metal bonds are bit-identical at the energy level, and the real cause was the CN cutoff (k). After the fcn (i), FT-HMO et (j), CN-cutoff (k), BATM eta-aware (l), metal-torsion (m) and HB-array (n) fixes the port is at per-structure MAD **0.004**, reaction MAD **0.008** vs pprcht/gfnff, **all 95 within 0.1 kcal**; worst per-structure now PR30/PR31 ~0.07 kcal (residual fine-precision). Every MOR41 GFN-FF residual >0.1 kcal has been traced to a specific bug and fixed. Analyzer for per-bond/angle/torsion ground-truth: `external/gfnff/_build/gfnff <xyz>` (prints pibo/fqq/fc + angle + torsion tables with `pr=.true.`). See [docs/MOR41_VALIDATION.md](docs/MOR41_VALIDATION.md).
 

@@ -38,17 +38,16 @@ if [ -z "$CURCUMA" ]; then
         fi
     fi
 
-    # Try release first (faster for CLI tests), then debug, then build
-    export CURCUMA="$PROJECT_ROOT/release/curcuma"
-    if [ ! -f "$CURCUMA" ]; then
-        export CURCUMA="$PROJECT_ROOT/debug/curcuma"
-    fi
-    if [ ! -f "$CURCUMA" ]; then
-        export CURCUMA="$PROJECT_ROOT/build/curcuma"
-    fi
-    if [ ! -f "$CURCUMA" ]; then
+    # Try release first (faster for CLI tests), then debug, build, and the GPU build dirs.
+    for _bd in release debug build release_rocm release_cuda release_vulkan build_rocm; do
+        if [ -f "$PROJECT_ROOT/$_bd/curcuma" ]; then
+            export CURCUMA="$PROJECT_ROOT/$_bd/curcuma"
+            break
+        fi
+    done
+    if [ -z "$CURCUMA" ] || [ ! -f "$CURCUMA" ]; then
         echo -e "${RED}ERROR: curcuma binary not found!${NC}"
-        echo "Expected at: $PROJECT_ROOT/debug/curcuma, $PROJECT_ROOT/release/curcuma, or $PROJECT_ROOT/build/curcuma"
+        echo "Expected at: $PROJECT_ROOT/{release,debug,build,release_rocm,release_cuda,release_vulkan}/curcuma"
         exit 1
     fi
     echo -e "${BLUE}Using curcuma:${NC} $CURCUMA"
@@ -170,6 +169,42 @@ assert_string_not_in_file() {
     fi
 }
 
+# Helper: Assert file exists and is non-empty (Claude Generated, June 2026)
+assert_file_not_empty() {
+    local filepath=$1
+    local msg=${2:-"File non-empty: $filepath"}
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ -s "$filepath" ]; then
+        echo -e "${GREEN}✓ PASS${NC}: $msg"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        return 0
+    else
+        echo -e "${RED}✗ FAIL${NC}: $msg (missing or empty: '$filepath')"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+}
+
+# Helper: Assert exact string equality (Claude Generated, June 2026)
+# Used to pin the ConfScan result fingerprint "<accepted> <reorder> <reuse> <skipped>".
+assert_equals() {
+    local expected=$1
+    local actual=$2
+    local msg=${3:-"Value equals"}
+
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [ "$expected" == "$actual" ]; then
+        echo -e "${GREEN}✓ PASS${NC}: $msg (got: '$actual')"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        return 0
+    else
+        echo -e "${RED}✗ FAIL${NC}: $msg (expected: '$expected', got: '$actual')"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        return 1
+    fi
+}
+
 # Helper: Compare numerical value with tolerance
 assert_numeric_match() {
     local expected=$1
@@ -209,6 +244,14 @@ extract_energy_from_xyz() {
     grep -oP 'Energy\s*=\s*\K[-0-9.]+' "$xyzfile" | head -1
 }
 
+# Helper: Extract the n-th energy value from a multi-frame XYZ file
+extract_nth_energy_from_xyz() {
+    local xyzfile=$1
+    local n=${2:-1}
+    # Curcuma format: "** Energy =   0.000000 Eh **" in each frame's comment line (line 2)
+    grep -oP 'Energy\s*=\s*\K[-0-9.]+' "$xyzfile" | sed -n "${n}p"
+}
+
 # Helper: Extract RMSD value from stdout
 extract_rmsd_from_output() {
     local file=$1
@@ -224,11 +267,20 @@ count_xyz_structures() {
         return
     fi
 
-    # Count how many times we see the start of a new structure
-    # Each structure starts with: <number_of_atoms>\n<comment>\n<coordinates>
-    awk 'NR % (natoms + 2) == 1 && NR == 1 {natoms = $1}
-         NR % (natoms + 2) == 1 && NR > 1 {count++}
-         END {print count + (NR > 0 ? 1 : 0)}' "$xyzfile"
+    # Count frames by reading each frame's own atom-count header (Claude Generated, June 2026).
+    # The previous version assumed a CONSTANT atom count across frames (NR % (natoms+2)); a
+    # multi-XYZ with mixed atom counts was miscounted. This walks frame-by-frame from the first
+    # header: read header -> skip comment + natoms coordinate lines -> next header. It counts
+    # every logical conformer entry, including degenerate 0-atom frames (so the "number of
+    # filtered structures" is reported correctly even when a writer emits reduced geometries).
+    awk '{
+        natoms = $1 + 0
+        count++
+        for (i = 0; i < natoms + 1; i++) {
+            if ((getline) <= 0) break
+        }
+    }
+    END { print count + 0 }' "$xyzfile"
 }
 
 # Helper: Compare floating point with tolerance (scientific validation)
@@ -339,37 +391,78 @@ setup_test_dir() {
     cd "$test_dir" || exit 1
 }
 
+# ============================================================================
+# BMT (Basename.Method.Timestamp) output directory helpers
+# With BMT default-on, output files go to basename.keyword.YYYYMMDD_HHMMSS/
+# These helpers resolve file paths whether BMT is on or off.
+# Claude Generated 2026
+# ============================================================================
+
+# Find a BMT output directory matching basename.keyword.* pattern
+# Usage: find_bmt_dir "input" "opt" -> "input.opt.20260609_143000"
+find_bmt_dir() {
+    local basename="$1"
+    local keyword="$2"
+    find . -maxdepth 1 -type d -name "${basename}.${keyword}.*" 2>/dev/null | head -1
+}
+
+# Find an output file, checking CWD first then BMT directories (depth 2)
+# Usage: find_output_file "input.opt.xyz" -> "input.opt.xyz" or "input.opt.20260609_143000/input.opt.xyz"
+find_output_file() {
+    local filename="$1"
+    # Check CWD first (backward compatibility with -no_bmt / BMT off)
+    if [ -f "$filename" ]; then
+        echo "$filename"
+        return 0
+    fi
+    # Search in BMT directories (basename.keyword.YYYYMMDD_HHMMSS/filename)
+    find . -maxdepth 2 -name "$filename" -type f 2>/dev/null | head -1
+}
+
+# Remove everything in the CWD except the named keep-files (Claude Generated, June 2026).
+# Tests run from build-tree dirs that accumulate stale output across runs; a partial
+# cleanup lets find_output_file match stale data and produces false pass/fail. This
+# guarantees a clean slate so each run is deterministic.
+# Usage: clean_dir_keep conformers.xyz run_test.sh
+clean_dir_keep() {
+    local prune=()
+    local f
+    for f in "$@"; do prune+=( ! -name "$f" ); done
+    find . -mindepth 1 -maxdepth 1 "${prune[@]}" -exec rm -rf {} + 2>/dev/null || true
+}
+
+# Extract the ConfScan result fingerprint "<accepted> <reorder> <reuse> <skipped>"
+# from a log file, tolerating ANSI color codes that may prefix the line (the line is
+# printed via std::cout right after colored CurcumaLogger output). Claude Generated.
+extract_confscan_summary() {
+    sed 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null | grep -E '^[0-9]+ [0-9]+ [0-9]+ [0-9]+$' | tail -1
+}
+
+# Remove BMT output directories in current directory
+cleanup_bmt_dirs() {
+    find . -maxdepth 1 -type d \( \
+        -name "*.opt.*" -o \
+        -name "*.md.*" -o \
+        -name "*.confscan.*" -o \
+        -name "*.confsearch.*" -o \
+        -name "*.confstat.*" -o \
+        -name "*.dock.*" -o \
+        -name "*.analysis.*" -o \
+        -name "*.rmsd.*" -o \
+        -name "*.hessian.*" -o \
+        -name "*.qmdfffit.*" -o \
+        -name "*.sp.*" \
+    \) -exec rm -rf {} + 2>/dev/null || true
+}
+
 # Helper: Cleanup test artifacts
 cleanup_test_artifacts() {
-    # Remove common Curcuma output files
+    # Remove common Curcuma output files in CWD
     rm -f *.opt.xyz *.trj.xyz *.restart.json *.vtf
     rm -f *.accepted.xyz *.rejected.xyz *.thresh.xyz *.initial.xyz
     rm -f *.reorder.*.xyz *.centered.xyz *.reordered.xyz
-    rm -f *.log *.dat *.pairs
+    rm -f *.log *.dat *.pairs *.diag.jsonl
     rm -f stdout.log stderr.log
-    # Remove BMT directories (Basename.Method.Timestamp pattern)
-    rm -rf *.*.*/
-}
-
-# Helper: Find output file in BMT directory or CWD
-# Usage: bmt_find_file <basename> <suffix>
-# Example: bmt_find_file conformers accepted.xyz
-# Returns the full path to the file, searching BMT dirs first (newest), then CWD
-bmt_find_file() {
-    local basename=$1
-    local suffix=$2
-    # Search in BMT directories first (newest first - sorted by modification time)
-    local bmt_dir=$(ls -td ${basename}.*.*/ 2>/dev/null | head -1)
-    if [ -n "$bmt_dir" ] && [ -f "${bmt_dir}${basename}.${suffix}" ]; then
-        echo "${bmt_dir}${basename}.${suffix}"
-    elif [ -f "${basename}.${suffix}" ]; then
-        echo "${basename}.${suffix}"
-    else
-        # Try finding the file directly in any BMT directory (newest first)
-        local found=$(find . -maxdepth 2 -name "${basename}.${suffix}" -type f -newer "${basename}.*.*/metadata.txt" 2>/dev/null | head -1)
-        if [ -z "$found" ]; then
-            found=$(find . -maxdepth 2 -name "${basename}.${suffix}" -type f 2>/dev/null | head -1)
-        fi
-        echo "$found"
-    fi
+    # Remove BMT output directories
+    cleanup_bmt_dirs
 }

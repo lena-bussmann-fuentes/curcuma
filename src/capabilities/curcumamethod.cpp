@@ -45,6 +45,8 @@ CurcumaMethod::CurcumaMethod(const json& defaults, const json& controller, bool 
     , m_controller(controller)
     , m_silent(silent)
 {
+    // Capture the parent's global verbosity before we overwrite it; the dtor restores it.
+    m_saved_global_verbosity = CurcumaLogger::get_verbosity();
     // Legacy constructor - convert boolean silent to verbosity levels
     if (controller.count("verbose") > 0) {
         m_silent = false;
@@ -96,6 +98,8 @@ CurcumaMethod::CurcumaMethod(const json& defaults, const json& controller, int v
     , m_controller(controller)
     , m_verbosity(verbosity)
 {
+    // Capture the parent's global verbosity before we overwrite it; the dtor restores it.
+    m_saved_global_verbosity = CurcumaLogger::get_verbosity();
     // Set legacy flags for backwards compatibility
     m_silent = (verbosity == 0);
     m_verbose = (verbosity >= 3);
@@ -137,6 +141,11 @@ CurcumaMethod::CurcumaMethod(const json& defaults, const json& controller, int v
 CurcumaMethod::~CurcumaMethod()
 {
     CurcumaLogger::printCitations();
+    // Restore the parent's global verbosity (see m_saved_global_verbosity). This is what makes the
+    // global level scoped: a sub-method created by a parent leaves the parent's level intact on
+    // destruction, so callers no longer need to re-assert their verbosity after each sub-call.
+    if (m_saved_global_verbosity >= 0)
+        CurcumaLogger::set_verbosity(m_saved_global_verbosity);
 }
 
 // Claude Generated 2025: Enhanced restart writing with automatic checksum and version
@@ -273,19 +282,27 @@ void CurcumaMethod::getBasename(const std::string& filename)
 {
     // Claude Generated 2026: Use proper extension stripping instead of crude 4-char removal
     // This correctly handles .xyz, .mol2, .sdf, .pdb, .trj, etc.
+    // Note: strips directory path so that a BMT-routed full path does not leak into m_basename.
 #ifdef C17
 #ifndef _WIN32
     std::filesystem::path p(filename);
     m_basename = p.stem().string();
 #else
-    size_t pos = filename.find_last_of('.');
-    m_basename = (pos != std::string::npos) ? filename.substr(0, pos) : filename;
+    std::string base = filename;
+    size_t slash = base.find_last_of("/\\");
+    if (slash != std::string::npos)
+        base = base.substr(slash + 1);
+    size_t pos = base.find_last_of('.');
+    m_basename = (pos != std::string::npos) ? base.substr(0, pos) : base;
 #endif
 #else
-    size_t pos = filename.find_last_of('.');
-    m_basename = (pos != std::string::npos) ? filename.substr(0, pos) : filename;
+    std::string base = filename;
+    size_t slash = base.find_last_of("/\\");
+    if (slash != std::string::npos)
+        base = base.substr(slash + 1);
+    size_t pos = base.find_last_of('.');
+    m_basename = (pos != std::string::npos) ? base.substr(0, pos) : base;
 #endif
-    m_filename = filename;
 }
 
 void CurcumaMethod::setFile(const std::string& filename)

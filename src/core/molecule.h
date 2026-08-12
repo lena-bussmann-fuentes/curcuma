@@ -85,7 +85,27 @@ class Molecule
       void ImportJson(const json& molecule);
 
       void Initialise(const int* attyp, const double* coord, const int natoms, const double charge, const int spin);
-      void ApplyReorderRule(const std::vector<int>& rule);
+
+      /**
+       * @brief Permute the atoms of this molecule according to `rule`.
+       *
+       * `rule` must be a complete permutation of [0, AtomCount()): rule[p] is the index
+       * of the atom that moves to position p. Any other input (empty, wrong length,
+       * out-of-range or duplicate indices) leaves the molecule untouched and returns
+       * false - a partial rule would silently shrink the molecule to rule.size() atoms.
+       *
+       * @return true if the molecule was reordered, false if the rule was rejected.
+       */
+      bool ApplyReorderRule(const std::vector<int>& rule);
+
+      /**
+       * @brief Copy of this molecule with all protons removed, heavy atoms in original order.
+       *
+       * Only elements and coordinates are carried over (no name, energy, charges, bonds).
+       * Claude Generated (Aug 2026) - shared by RMSDDriver::ProtonDepleted() and ConfScan's
+       * heavy-atom comparison path, which need identical heavy-atom indexing.
+       */
+      Molecule ProtonDepletedCopy() const;
 
       void print_geom(bool moreinfo = true) const;
       void printFragmente();
@@ -239,6 +259,7 @@ class Molecule
       inline void writeXYZFile() const { writeXYZFile(Name() + ".xyz"); }
 
       void appendXYZFile(const std::string& filename) const;
+      void appendXYZFile(const std::string& filename, const std::string& comment) const;
       inline void appendXYZFile() const { appendXYZFile(Name() + ".xyz"); }
 
       // Claude Generated (Nov 2025): VTF trajectory output for CG systems
@@ -386,8 +407,18 @@ class Molecule
      * \\return Pair of {distance_matrix, topology_matrix}
      * \\note Automatically cached - repeated calls are very fast
      * \\note Cache invalidated on geometry changes
+     * \\note If a persistent topology is set, it overrides distance-based detection
      */
     std::pair<Matrix, Matrix> DistanceMatrix() const;
+
+    /*! \brief Set a persistent topology matrix that overrides distance-based detection */
+    void setTopologyMatrix(const Matrix& topology);
+
+    /*! \brief Check if a persistent topology matrix is present */
+    inline bool hasPersistentTopology() const { return m_has_persistent_topology; }
+
+    /*! \brief Get the current topology matrix */
+    inline Matrix getTopologyMatrix() const { return m_topology_matrix; }
     /*! \brief Index-based distance matrix for selective atom analysis - Claude Generated */
     std::pair<Matrix, Matrix> DistanceMatrix(const std::vector<int>& indices) const;
 
@@ -456,6 +487,8 @@ private:
     // Future: Granular cache system (geometry, connectivity, properties, analysis)
     mutable Matrix m_distance_matrix;
     mutable Matrix m_topology_matrix;
+    mutable Matrix m_persistent_topology;
+    mutable bool m_has_persistent_topology = false;
     mutable bool m_distance_cache_valid = false;
 
     mutable bool m_dirty = true;

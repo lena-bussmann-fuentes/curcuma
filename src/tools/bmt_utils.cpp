@@ -31,9 +31,14 @@ std::string createBMTDir(const std::string& basename, const std::string& keyword
 {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::tm* local_tm = std::localtime(&now_time);
+    std::tm local_tm_buf{};
+#ifdef _WIN32
+    localtime_s(&local_tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &local_tm_buf);
+#endif
     char timestamp[32];
-    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", local_tm);
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local_tm_buf);
 
     std::string bmt_dir = basename + "." + keyword + "." + timestamp;
 
@@ -52,7 +57,7 @@ void writeMetadata(const std::string& bmt_dir,
                    const std::string& method,
                    const std::string& input_file)
 {
-    std::string meta_path = bmt_dir + "/metadata.txt";
+    std::string meta_path = bmt_dir + "/metadata.json";
     std::ofstream meta(meta_path);
     if (!meta.is_open()) {
         CurcumaLogger::warn_fmt("Could not create metadata file: {}", meta_path);
@@ -61,23 +66,35 @@ void writeMetadata(const std::string& bmt_dir,
 
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::tm* local_tm = std::localtime(&now_time);
+    std::tm local_tm_buf{};
+#ifdef _WIN32
+    localtime_s(&local_tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &local_tm_buf);
+#endif
     char timestamp[32];
-    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", local_tm);
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &local_tm_buf);
 
-    meta << "# Curcuma Calculation Metadata\n";
-    meta << "basename: " << basename << "\n";
-    meta << "method: " << method << "\n";
-    meta << "timestamp: " << timestamp << "\n";
-    meta << "input_file: " << input_file << "\n";
+    nlohmann::json j;
+    j["basename"] = basename;
+    j["method"] = method;
+    j["timestamp"] = std::string(timestamp);
+    j["input_file"] = input_file;
+    meta << j.dump(2) << "\n";
     meta.close();
 }
 
 void processBakFiles(const std::string& bmt_dir,
                      const std::vector<std::string>& bak_files)
 {
-    if (bmt_dir.empty() || bak_files.empty())
+    if (bak_files.empty())
         return;
+
+    // Claude Generated 2026: Warn when -bak is used without an active BMT path
+    if (bmt_dir.empty()) {
+        CurcumaLogger::warn_fmt("-bak flag has no effect without BMT output directory (use default mode or remove -no_bmt)");
+        return;
+    }
 
 #ifdef C17
 #ifndef _WIN32
@@ -100,6 +117,43 @@ std::string outputPath(const std::string& bmt_dir, const std::string& filename)
     if (bmt_dir.empty())
         return filename;
     return bmt_dir + "/" + filename;
+}
+
+std::string stripExtension(const std::string& filename)
+{
+    // Claude Generated 2026: Properly strip file extension for .xyz, .mol2, .sdf, .pdb, etc.
+    // Handles multi-dot filenames correctly (e.g. "input.opt.xyz" -> "input.opt")
+#ifdef C17
+#ifndef _WIN32
+    std::filesystem::path p(filename);
+    return p.stem().string();
+#else
+    size_t pos = filename.find_last_of('.');
+    return (pos != std::string::npos) ? filename.substr(0, pos) : filename;
+#endif
+#else
+    size_t pos = filename.find_last_of('.');
+    return (pos != std::string::npos) ? filename.substr(0, pos) : filename;
+#endif
+}
+
+std::vector<std::string> collectBakFiles(const nlohmann::json& controller)
+{
+    // Claude Generated 2026: Extract -bak file names from JSON controller
+    // Handles both "bak": "file.xyz" (string) and "bak": ["a.xyz", "b.xyz"] (array)
+    std::vector<std::string> bak_files;
+    if (!controller.contains("bak"))
+        return bak_files;
+
+    if (controller["bak"].is_string()) {
+        bak_files.push_back(controller["bak"].get<std::string>());
+    } else if (controller["bak"].is_array()) {
+        for (const auto& f : controller["bak"]) {
+            if (f.is_string())
+                bak_files.push_back(f.get<std::string>());
+        }
+    }
+    return bak_files;
 }
 
 } // namespace BMTUtils

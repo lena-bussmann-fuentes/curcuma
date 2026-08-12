@@ -46,7 +46,7 @@ FileIterator::FileIterator(const std::string& filename, bool silent)
     }
 
     if (!silent)
-        std::cerr << "Opening file " << m_filename << std::endl;
+        CurcumaLogger::info_fmt("Opening file {}", m_filename); // Claude Generated: verbosity >=2 only
     m_basename = filename;
     m_basename.erase(m_basename.end() - 4, m_basename.end());
     m_file = new std::ifstream(m_filename);
@@ -69,7 +69,7 @@ FileIterator::FileIterator(const std::string& filename, bool silent)
     m_init = CheckNext();
 }
 
-FileIterator::FileIterator(char* filename, bool silent)
+FileIterator::FileIterator(const char* filename, bool silent)
 {
     m_filename = std::string(filename);
 
@@ -80,7 +80,7 @@ FileIterator::FileIterator(char* filename, bool silent)
     }
 
     if (!silent)
-        std::cerr << "Opening file " << m_filename << std::endl;
+        CurcumaLogger::info_fmt("Opening file {}", m_filename); // Claude Generated: verbosity >=2 only
     m_basename = std::string(filename);
     m_basename.erase(m_basename.end() - 4, m_basename.end());
     m_file = new std::ifstream(m_filename);
@@ -219,9 +219,16 @@ bool FileIterator::CheckNext()
             index++;
         }
     } else {
+        // Non-XYZ single-molecule file (mol2, sdf, json, coord). Deliver it once,
+        // then report end-of-file. Returning false unconditionally here caused an
+        // infinite loop for any non-XYZ (or empty) filename iterated via
+        // while(!AtEnd()).
+        if (m_nonxyz_loaded)
+            return true;
+        m_nonxyz_loaded = true;
         m_current = Files::LoadFile(m_filename);
         m_init = true;
-        return false;
+        return m_current.AtomCount() == 0; // failed/empty load -> end immediately
     }
     return true;
 }

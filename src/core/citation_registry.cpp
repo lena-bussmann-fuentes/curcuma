@@ -16,27 +16,47 @@
 std::vector<std::string> CitationRegistry::m_cited_keys;
 std::set<std::string> CitationRegistry::m_seen;
 std::vector<std::pair<std::string, std::string>> CitationRegistry::m_subrefs;
+std::mutex CitationRegistry::m_mutex;
 
 void CitationRegistry::cite(const std::string& key, const std::string& parent)
 {
-    // Already cited — silent no-op
-    if (m_seen.count(key)) return;
+    // Lock-free fast path (Claude Generated, Jun 2026): cite() is called from every
+    // ComputationalMethod::calculateEnergy, i.e. on the hot path — every MD/opt step times every
+    // parallel worker (e.g. GFN-FF fires 9 cites per energy eval). The registry below is already
+    // mutex-safe, but taking the global lock that often needlessly serialises the workers. A
+    // thread_local cache of keys this thread has already registered lets each worker skip the
+    // global mutex after the first sighting, so the lock is taken at most once per (thread, key).
+    // NOTE: CitationRegistry::clear() (testing only; currently unused) does NOT reset this cache —
+    // if clear() is ever used for re-citation, add a generation counter to invalidate the cache.
+    thread_local std::set<std::string> tls_seen;
+    if (tls_seen.count(key)) return;
 
-    // Look up citation data
-    const Citations::CitationData* data = Citations::lookup(key);
-    if (!data) {
-        CurcumaLogger::warn("CitationRegistry: unknown key '" + key + "'");
-        return;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Already cited by some thread — record locally so this thread skips the lock next time.
+        if (m_seen.count(key)) {
+            tls_seen.insert(key);
+            return;
+        }
+
+        // Look up citation data
+        const Citations::CitationData* data = Citations::lookup(key);
+        if (!data) {
+            CurcumaLogger::warn("CitationRegistry: unknown key '" + key + "'");
+            return; // not cached: an unknown key is a bug worth re-warning if it recurs
+        }
+
+        // Register
+        m_cited_keys.push_back(key);
+        m_seen.insert(key);
+
+        // Track sub-reference relationship
+        if (!parent.empty()) {
+            m_subrefs.push_back({key, parent});
+        }
     }
-
-    // Register
-    m_cited_keys.push_back(key);
-    m_seen.insert(key);
-
-    // Track sub-reference relationship
-    if (!parent.empty()) {
-        m_subrefs.push_back({key, parent});
-    }
+    tls_seen.insert(key);
 
     // Registration is silent; citations are printed once in the end-of-run summary.
     // (Previously logged immediately, but that cluttered the output during calculations.)
@@ -44,6 +64,7 @@ void CitationRegistry::cite(const std::string& key, const std::string& parent)
 
 void CitationRegistry::printSummary()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_cited_keys.empty()) return;
 
     fmt::print("\n");
@@ -57,28 +78,42 @@ void CitationRegistry::printSummary()
         children.insert(child);
     }
 
-    // Helper: print one entry (description + reference, two lines)
+    // Helper: print one entry (description + reference lines)
     auto printEntry = [](const std::string& prefix, const Citations::CitationData* data) {
         fmt::print(fg(fmt::color::green), "  [CITE]  {}\n", prefix + data->description);
-        fmt::print(fg(fmt::color::green), "          {}\n", data->reference);
+        // Split reference on newlines for multi-reference entries
+        std::string ref = data->reference;
+        std::string indent = "          ";
+        size_t pos = 0;
+        while (pos < ref.size()) {
+            auto nl = ref.find('\n', pos);
+            if (nl == std::string::npos) {
+                fmt::print(fg(fmt::color::green), "{}{}\n", indent, ref.substr(pos));
+                break;
+            }
+            fmt::print(fg(fmt::color::green), "{}{}\n", indent, ref.substr(pos, nl - pos));
+            pos = nl + 1;
+        }
     };
 
-    // Print top-level entries (those that are not children of another)
-    for (const auto& key : m_cited_keys) {
-        if (children.count(key)) continue;
-
+    // Recursive helper: print a key and all its children at increasing indent
+    std::function<void(const std::string&, const std::string&)> printTree;
+    printTree = [&](const std::string& key, const std::string& indent) {
         const Citations::CitationData* data = Citations::lookup(key);
-        if (!data) continue;
+        if (!data) return;
+        printEntry(indent, data);
 
-        printEntry("", data);
-
-        // Print sub-references of this parent (indented, without raw key)
+        // Print sub-references of this key at next indent level
         for (const auto& [child, parent] : m_subrefs) {
             if (parent != key) continue;
-            const Citations::CitationData* child_data = Citations::lookup(child);
-            if (!child_data) continue;
-            printEntry("  -> ", child_data);
+            printTree(child, indent + "  -> ");
         }
+    };
+
+    // Print top-level entries (those that are not children of another), recursively
+    for (const auto& key : m_cited_keys) {
+        if (children.count(key)) continue;
+        printTree(key, "");
     }
 
     fmt::print(fg(fmt::color::green), "===============================================================\n");
@@ -86,6 +121,7 @@ void CitationRegistry::printSummary()
 
 void CitationRegistry::writeBibTeX(const std::string& output_dir, const std::string& basename)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_cited_keys.empty()) return;
 
     // Derive filename
@@ -123,6 +159,7 @@ void CitationRegistry::writeBibTeX(const std::string& output_dir, const std::str
 
 void CitationRegistry::clear()
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_cited_keys.clear();
     m_seen.clear();
     m_subrefs.clear();
@@ -130,5 +167,6 @@ void CitationRegistry::clear()
 
 bool CitationRegistry::hasKey(const std::string& key)
 {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_seen.count(key) > 0;
 }

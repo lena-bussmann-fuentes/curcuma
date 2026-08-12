@@ -34,6 +34,7 @@
 #include <iostream>
 #include <math.h>
 #include <stdio.h>
+#include <stdexcept>
 
 #include "tbliteinterface.h"
 
@@ -50,12 +51,20 @@ TBLiteInterface::TBLiteInterface(const ConfigManager& config)
     m_Tele /= 315775.326864009;
     m_spin = m_config.get<double>("spin", 0.0);
     std::string guess = m_config.get<std::string>("initial_guess", "SAD");
-    m_solvent_eps = m_config.get<double>("solvent_epsilon", -1.0);
-    m_solvent_model = m_config.get<int>("solvent_model", 0);
 
+    // Solvation parameters
     std::string tmp = m_config.get<std::string>("solvent", "none");
     m_solvent = new char[tmp.length() + 1];
     strcpy(m_solvent, tmp.c_str());
+    m_solvent_eps = m_config.get<double>("solvent_epsilon", -1.0);
+
+    // Auto-enable solvation if solvent is specified (not "none")
+    if (tmp != "none" && tmp != "" && tmp != "vacuum") {
+        m_solvent_model = m_config.get<int>("solvent_model", 2);  // Default: GB (Generalized Born)
+    } else {
+        m_solvent_model = m_config.get<int>("solvent_model", 0);  // No solvation
+    }
+
     m_solvent_gb_version = m_config.get<int>("solvent_gb_version", 0);
     m_solvent_gb_kernel = m_config.get<int>("solvent_gb_kernel", 1);
     m_solvent_alpb_version = m_config.get<int>("solvent_alpb_version", 12);
@@ -89,8 +98,16 @@ TBLiteInterface::TBLiteInterface(const ConfigManager& config)
         CurcumaLogger::param("SCF_maxiter", fmt::format("{}", m_SCFmaxiter));
         CurcumaLogger::param("temperature", fmt::format("{:.1f} K", m_Tele * 315775.326864009));
         CurcumaLogger::param("damping", fmt::format("{:.3f}", m_damping));
+
         if (m_solvent_model > 0) {
-            CurcumaLogger::param("solvation", "enabled");
+            std::string model_name = (m_solvent_model == 1) ? "CPCM" :
+                                     (m_solvent_model == 2) ? "GB (Generalized Born)" :
+                                     (m_solvent_model == 3) ? "ALPB" : "Unknown";
+            CurcumaLogger::param("solvation_model", model_name);
+            CurcumaLogger::param("solvent", std::string(m_solvent));
+            if (m_solvent_eps > 0) {
+                CurcumaLogger::param("dielectric_constant", fmt::format("{:.2f}", m_solvent_eps));
+            }
         }
     }
 }
@@ -273,7 +290,10 @@ void TBLiteInterface::ApplySolvation()
             CurcumaLogger::param("gb_kernel", m_solvent_gb_kernel);
         }
         CurcumaLogger::error("GB solvation model not functional");
-        exit(1);
+        // Claude Generated fix, 2026-06: throw instead of exit(1) — a library must not
+        // kill the host process. (The following tblite_new_gb_solvation_epsilon line was
+        // already dead code behind exit(); left unreachable rather than touched.)
+        throw std::runtime_error("TBLite GB solvation model is not functional in this build");
         m_tb_cont = tblite_new_gb_solvation_epsilon(m_error, m_tblite_mol, m_solvent_eps, m_solvent_gb_version, m_solvent_gb_kernel);
         if (tblite_check_context(m_ctx)) {
             tbliteError();

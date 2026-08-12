@@ -23,8 +23,19 @@
 #include "src/core/citation_registry.h"
 #include "src/core/fileiterator.h"
 #include "src/core/global.h"
+#include <cstdio>
 #include <filesystem>
 #include <fmt/core.h>
+#include <memory>
+
+// Claude Generated 2026 - MSVC spells the POSIX pipe helpers with a leading
+// underscore (_popen/_pclose in <cstdio>); it has no popen/pclose. MinGW, Clang and
+// GCC all provide the unprefixed names natively, so remap only under MSVC. The
+// MolAlignStrategy below shells out to the external molalign binary via popen().
+#ifdef _MSC_VER
+#define popen _popen
+#define pclose _pclose
+#endif
 
 // Claude Generated - Strategy Factory implementation with enum support
 std::unique_ptr<AlignmentStrategy> AlignmentStrategyFactory::createStrategy(AlignmentMethod method)
@@ -126,7 +137,12 @@ AlignmentResult IncrementalAlignmentStrategy::align(RMSDDriver* driver, const Al
         int max = std::min(driver->m_reference.AtomCount(), driver->m_target.AtomCount());
         int combinations = 0;
         int wake_up = 100;
-        CxxThreadPool* pool = new CxxThreadPool;
+        bool exhausted = false;
+        /* Claude Generated (Aug 2026): unique_ptr - the enclosing try/catch previously
+           leaked both the pool and its never-joined persistent worker threads if
+           anything below threw. */
+        auto pool_owner = std::make_unique<CxxThreadPool>();
+        CxxThreadPool* pool = pool_owner.get();
 
         // Progress bar control based on verbosity
         if (driver->m_verbosity == 0)
@@ -201,8 +217,18 @@ AlignmentResult IncrementalAlignmentStrategy::align(RMSDDriver* driver, const Al
                         CURCUMA_INFO(fmt::format("Element {} : ({:.3f} {:.3f} {:.3f})", atom.first, atom.second[0], atom.second[1], atom.second[2]));
                     }
                     reference_reordered++;
-                } else
+                } else {
+                    /* This atom has already been pushed to the end once - no further
+                       progress is possible. Claude Generated (Aug 2026): the assignment
+                       alone does not terminate the loop: the exit test is
+                       (reference_reordered + reference_not_reorordered) <= AtomCount(),
+                       so with reference_not_reorordered == 0 (nothing ever matched) it
+                       stays true while nothing else in this branch changes - an infinite
+                       loop spinning inside a worker thread, with the enclosing
+                       StartAndWait() blocked forever. Terminate explicitly. */
                     reference_reordered = driver->m_reference.AtomCount();
+                    exhausted = true;
+                }
             } else {
                 ref = reference;
                 storage_shelf = storage_shelf_next;
@@ -216,8 +242,9 @@ AlignmentResult IncrementalAlignmentStrategy::align(RMSDDriver* driver, const Al
                 reference_not_reorordered++;
             }
             pool->clear();
+            if (exhausted)
+                break;
         }
-        delete pool;
 
         // Final processing
         int count = 0;
@@ -371,6 +398,11 @@ AlignmentResult HeavyTemplateStrategy::align(RMSDDriver* driver, const Alignment
         driver->m_reference = reference;
         driver->m_target = target;
         driver->m_init_count = driver->m_heavy_init;
+        // The incremental strategy below reads m_reference.ConnectedMass(i); these template
+        // subset molecules are built fresh, so their connected-mass cache is empty (start()
+        // fills it only for the full molecules) — initialise it here or ConnectedMass() reads
+        // out of bounds (debug abort / release UB). (TECHNICAL_DEBT R-5)
+        driver->m_reference.InitialiseConnectedMass(1.5, driver->m_protons);
 
         // Use incremental strategy for heavy atoms only
         auto incremental_strategy = AlignmentStrategyFactory::createStrategy(1);
@@ -477,6 +509,11 @@ AlignmentResult AtomTemplateStrategy::align(RMSDDriver* driver, const AlignmentC
         driver->m_reference = reference;
         driver->m_target = target;
         driver->m_init_count = driver->m_heavy_init;
+        // The incremental strategy below reads m_reference.ConnectedMass(i); these template
+        // subset molecules are built fresh, so their connected-mass cache is empty (start()
+        // fills it only for the full molecules) — initialise it here or ConnectedMass() reads
+        // out of bounds (debug abort / release UB). (TECHNICAL_DEBT R-5)
+        driver->m_reference.InitialiseConnectedMass(1.5, driver->m_protons);
 
         // Use incremental strategy for template atoms only
         auto incremental_strategy = AlignmentStrategyFactory::createStrategy(1);
@@ -842,8 +879,18 @@ AlignmentResult DistanceTemplateStrategy::align(RMSDDriver* driver, const Alignm
         auto ref_end = m_distance_reference.cend();
         auto tar_end = m_distance_target.cend();
 
-        // Select template atoms based on largest distances
-        while (reference_indicies.size() < config.limit) {
+        // Claude Generated: cap the requested template size to the number of atoms
+        // actually available, so config.limit (default 10) cannot exceed the molecule.
+        const std::size_t limit = std::min<std::size_t>(config.limit,
+            std::min(driver->m_reference.AtomCount(), driver->m_target.AtomCount()));
+
+        // Select template atoms based on largest distances.
+        // Guard the iterators against underflowing past cbegin(): on small molecules
+        // (fewer than `limit` matchable template atoms) decrementing past begin() is
+        // undefined behaviour and crashes. Stop once either distance map is exhausted.
+        while (reference_indicies.size() < limit
+            && ref_end != m_distance_reference.cbegin()
+            && tar_end != m_distance_target.cbegin()) {
             ref_end--;
             tar_end--;
             std::pair<int, Position> atom_r1 = driver->m_reference.Atom(ref_end->second.first);
@@ -867,6 +914,16 @@ AlignmentResult DistanceTemplateStrategy::align(RMSDDriver* driver, const Alignm
             ++i;
         }
 
+        // Claude Generated: if no common template atoms could be selected (e.g. the
+        // structures share no element pairing), the incremental step below would run
+        // on empty molecules. Fail cleanly instead.
+        if (reference_indicies.empty()) {
+            result.success = false;
+            result.error_message = "Distance template: no common template atoms found";
+            CURCUMA_ERROR(result.error_message);
+            return result;
+        }
+
         // Cache original molecules
         Molecule cached_reference_mol = driver->m_reference;
         Molecule cached_target_mol = driver->m_target;
@@ -875,6 +932,11 @@ AlignmentResult DistanceTemplateStrategy::align(RMSDDriver* driver, const Alignm
         driver->m_reference = reference;
         driver->m_target = target;
         driver->m_init_count = driver->m_heavy_init;
+        // The incremental strategy below reads m_reference.ConnectedMass(i); these template
+        // subset molecules are built fresh, so their connected-mass cache is empty (start()
+        // fills it only for the full molecules) — initialise it here or ConnectedMass() reads
+        // out of bounds (debug abort / release UB). (TECHNICAL_DEBT R-5)
+        driver->m_reference.InitialiseConnectedMass(1.5, driver->m_protons);
 
         // Use incremental strategy for template alignment
         auto incremental_strategy = AlignmentStrategyFactory::createStrategy(1);

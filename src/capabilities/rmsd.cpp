@@ -192,7 +192,11 @@ void RMSDDriver::LoadFragmentAndThreadingParameters()
     m_molaligntol = m_config.get<int>("molalign_tolerance");
 
     m_force_reorder = m_config.get<bool>("force_reorder");
-    m_protons = m_config.get<bool>("protons");
+    /* Claude Generated (Aug 2026): 'heavy' is the inverse of 'protons' and used to be a
+       plain alias, which made '-heavy' request protons=true - a no-op. Combining them
+       keeps every default and every '-protons false' invocation working, while '-heavy'
+       now means what the help text says. */
+    m_protons = m_config.get<bool>("protons") && !m_config.get<bool>("heavy");
     // Legacy silent parameter removed - using verbosity system instead - Claude Generated
     m_intermedia_storage = m_config.get<double>("storage");
     m_dynamic_center = m_config.get<bool>("dynamic_center");
@@ -250,21 +254,26 @@ void RMSDDriver::LoadAlignmentMethodParameters()
 {
     std::string method = m_config.get<std::string>("method");
     m_munkress_cycle = 1;
-    m_limit = 0;
 
     // Claude Generated 2025: Clean enum-based method selection
     auto it = method_map.find(method);
     if (it != method_map.end()) {
         m_method = static_cast<int>(it->second);
     } else {
-        CurcumaLogger::warn_fmt("Unknown alignment method '{}', defaulting to 'incr'", method);
-        m_method = static_cast<int>(AlignmentMethod::INCREMENTAL);
+        // Claude Generated (June 2026): Fall back to the recommended default 'subspace'
+        // (ATOM_TEMPLATE) instead of the legacy 'incr', which is so slow on larger ensembles
+        // that an unknown method looked like a hang. subspace gives a sane, fast result.
+        CurcumaLogger::warn_fmt("Unknown alignment method '{}', defaulting to 'subspace'", method);
+        m_method = static_cast<int>(AlignmentMethod::ATOM_TEMPLATE);
     }
 
-    // Set limit for subspace and dtemplate methods
+    // Set limit for atom_template and dtemplate; 0 means use class default (m_limit = 10)
     if (m_method == static_cast<int>(AlignmentMethod::ATOM_TEMPLATE) ||
         m_method == static_cast<int>(AlignmentMethod::DISTANCE_TEMPLATE)) {
-        m_limit = m_config.get<int>("limit");
+        int limit = m_config.get<int>("limit");
+        if (limit > 0)
+            m_limit = limit;
+        // else keep class default m_limit = 10
     }
 
     // Level 1: Method approach display - Claude Generated
@@ -536,7 +545,10 @@ void RMSDDriver::start()
     m_reference_aligned.LoadMolecule(m_reference);
     if (m_reference.Atoms() != m_target.Atoms() || m_force_reorder) {
         if (!m_noreorder || m_method == 10) {
-            // std::cout << "Reordering Atoms" << std::endl;
+            /* Capture plain Kabsch RMSD (original atom order) before permutation so that
+               RMSDRaw() / rmsd_raw in JSON shows the cost of the unpermuted ordering. */
+            if (m_reference.Atoms() == m_target.Atoms())
+                m_rmsd_raw = CalculateRMSD(m_reference, m_target, nullptr, nullptr);
             ReorderMolecule();
             rmsd_calculated = true;
         }
@@ -630,6 +642,30 @@ double RMSDDriver::SimpleRMSD()
 double RMSDDriver::BestFitRMSD()
 {
     double rmsd = 0;
+    // Claude Generated (Jun 2026): flexibility-weighted Kabsch path. Only taken when
+    // per-atom weights are set and match the atom count; otherwise the unweighted path
+    // below runs unchanged (bit-identical to before).
+    if (!m_rmsd_weights.empty()
+        && static_cast<int>(m_rmsd_weights.size()) == m_reference.getGeometry().rows()) {
+        Geometry ref = m_reference.getGeometry();
+        Geometry tar = m_target.getGeometry();
+        Eigen::Vector3d cr = RMSDFunctions::WeightedCentroid(ref, m_rmsd_weights);
+        Eigen::Vector3d ct = RMSDFunctions::WeightedCentroid(tar, m_rmsd_weights);
+        for (int i = 0; i < ref.rows(); ++i) {
+            ref.row(i) -= cr.transpose();
+            tar.row(i) -= ct.transpose();
+        }
+        Eigen::Matrix3d R = RMSDFunctions::BestFitRotationW(ref, tar, m_rmsd_weights);
+        const auto t = RMSDFunctions::applyRotation(tar, R);
+        m_reference_aligned.setGeometry(ref);
+        m_target_aligned.setGeometry(t);
+        m_reference.setGeometry(ref);
+        m_target.setGeometry(t);
+        rmsd = RMSDFunctions::getRMSDW(ref, t, m_rmsd_weights);
+        m_rmsd = rmsd;
+        m_rotation = R;
+        return rmsd;
+    }
     auto reference = CenterMolecule(m_reference.getGeometry());
     auto target = CenterMolecule(m_target.getGeometry());
     // const auto t = RMSDFunctions::getAligned(reference, target, 1);
@@ -640,6 +676,27 @@ double RMSDDriver::BestFitRMSD()
     m_reference.setGeometry(reference);
     m_target.setGeometry(t);
     rmsd = RMSDFunctions::getRMSD(reference, t);
+    m_rmsd = rmsd;
+    m_rotation = R;
+    return rmsd;
+}
+
+double RMSDDriver::BestFitRMSDCentered()
+{
+    // Claude Generated (Jul 2026): fast path for the RMSD-MTD screen. Both m_reference and m_target
+    // must already hold geometric-centered coordinates. We skip the two CenterMolecule passes of
+    // BestFitRMSD (the walker is centered once per MD step; hills are pre-centered), compute the
+    // Kabsch rotation, apply it to the target, and store the aligned geometries so Gradient() --
+    // which reads (m_reference - m_target) -- stays correct. The reference is left untouched so it
+    // remains the centered walker across all hills in the step.
+    const Geometry reference = m_reference.getGeometry();
+    const Geometry target = m_target.getGeometry();
+    Eigen::Matrix3d R = RMSDFunctions::BestFitRotation(reference, target, 1);
+    const auto t = RMSDFunctions::applyRotation(target, R);
+    m_reference_aligned.setGeometry(reference);
+    m_target_aligned.setGeometry(t);
+    m_target.setGeometry(t);
+    double rmsd = RMSDFunctions::getRMSD(reference, t);
     m_rmsd = rmsd;
     m_rotation = R;
     return rmsd;
@@ -745,6 +802,12 @@ void RMSDDriver::reset()
     m_prepared_cost_matrices.clear();
     m_intermediate_cost_matrices.clear();
     m_intermedia_rules.clear();
+    /* Claude Generated (Aug 2026): the incremental-alignment loop
+       (rmsd_strategies.cpp) uses m_reorder_reference_geometry.rows() as its entry
+       condition. InitialisePair() re-seeds it only when m_initial is empty, so a driver
+       reused for many pairs (ConfScan) kept the previous pair's row count on the
+       -initial / initial_fragment path and could skip the loop entirely. */
+    m_reorder_reference_geometry = Geometry();
     m_rmsd = 0.0;
 }
 
@@ -762,6 +825,7 @@ void RMSDDriver::clear()
     m_reorder_rules.clear();
     m_reorder_reference.clear();
     m_reorder_target.clear();
+    m_reorder_reference_geometry = Geometry(); // see reset() - stale row count skips the incremental loop
     m_rotation = Eigen::Matrix3d::Identity();
     m_rmsd = 0.0;
 }
@@ -824,21 +888,10 @@ void RMSDDriver::ProtonDepleted()
     if (m_verbosity >= 2)
         CurcumaLogger::info("Will perform calculation on proton depleted structure");
 
-    Molecule reference;
-    for (std::size_t i = 0; i < m_reference.AtomCount(); ++i) {
-        std::pair<int, Position> atom = m_reference.Atom(i);
-        if (atom.first != 1)
-            reference.addPair(atom);
-    }
-
-    Molecule target;
-    for (std::size_t i = 0; i < m_target.AtomCount(); ++i) {
-        std::pair<int, Position> atom = m_target.Atom(i);
-        if (atom.first != 1)
-            target.addPair(atom);
-    }
-    m_reference = reference;
-    m_target = target;
+    // Claude Generated (Aug 2026): shared with ConfScan's heavy-atom path via
+    // Molecule::ProtonDepletedCopy(), so both produce identical heavy-atom indexing.
+    m_reference = m_reference.ProtonDepletedCopy();
+    m_target = m_target.ProtonDepletedCopy();
     m_init_count = m_heavy_init;
 }
 
@@ -1007,14 +1060,22 @@ void RMSDDriver::ReorderMolecule()
     if (method != AlignmentMethod::MOLALIGN && method != AlignmentMethod::PREDEFINED_ORDER) {
         FinaliseTemplate();
 
-        m_target_reordered = ApplyOrder(m_reorder_rules, m_target);
         m_target_aligned = m_target;
         m_reorder_rules = m_results.begin()->second;
         m_target_reordered = ApplyOrder(m_reorder_rules, m_target);
+        /* Apply Kabsch alignment so that reorder_xyz in the JSON output is in the same
+           coordinate frame as reference_xyz and can be overlaid directly in viewers. */
+        Molecule aligned_reordered;
+        CalculateRMSD(m_reference, m_target_reordered, nullptr, &aligned_reordered);
+        m_target_reordered = aligned_reordered;
         m_target = m_target_reordered;
         m_rmsd = m_results.begin()->first;
     } else if (method == AlignmentMethod::PREDEFINED_ORDER) {
         m_target_reordered = ApplyOrder(m_reorder_rules, m_target);
+        /* Apply Kabsch alignment for consistent reorder_xyz output. */
+        Molecule aligned_reordered;
+        CalculateRMSD(m_reference, m_target_reordered, nullptr, &aligned_reordered);
+        m_target_reordered = aligned_reordered;
         m_rmsd = Rules2RMSD(m_reorder_rules);
         if (m_verbosity >= 2)
             CurcumaLogger::info_fmt("Final RMSD: {:.6f}", m_rmsd);
@@ -1033,7 +1094,7 @@ void RMSDDriver::FinaliseTemplate()
     std::ofstream result_file;
     m_kuhn_munkres_iterations = 0;
     if (m_kmstat)
-        result_file.open("kmstat.dat", std::ios_base::app);
+        result_file.open(outputPath("kmstat.dat"), std::ios_base::app);
     for (auto permutation : m_prepared_cost_matrices) {
 #ifdef CURCUMA_DEBUG
         if (m_verbosity >= 3)
@@ -1337,7 +1398,14 @@ std::pair<std::vector<int>, std::vector<int>> RMSDDriver::PrepareDistanceTemplat
     auto ref_end = m_distance_reference.cend();
     auto tar_end = m_distance_target.cend();
 
-    while (reference_indicies.size() < m_limit) {
+    // Claude Generated: cap to available atoms and guard against iterator underflow
+    // (see DistanceTemplateStrategy::align — this is an unused legacy duplicate).
+    const std::size_t limit = std::min<std::size_t>(m_limit,
+        std::min(m_reference.AtomCount(), m_target.AtomCount()));
+
+    while (reference_indicies.size() < limit
+        && ref_end != m_distance_reference.cbegin()
+        && tar_end != m_distance_target.cbegin()) {
         ref_end--;
         tar_end--;
         std::pair<int, Position> atom_r1 = m_reference.Atom(ref_end->second.first);
@@ -1603,14 +1671,20 @@ std::pair<Matrix, Position> RMSDDriver::GetOperateVectors(const Molecule& refere
 
 bool RMSDDriver::MolAlignLib()
 {
-    m_reference.writeXYZFile("molaign_ref.xyz");
-    m_target.writeXYZFile("molalign_tar.xyz");
+    std::string ref_tmp = outputPath("molaign_ref.xyz");
+    std::string tar_tmp = outputPath("molalign_tar.xyz");
+    m_reference.writeXYZFile(ref_tmp);
+    m_target.writeXYZFile(tar_tmp);
 
     FILE* FileOpen;
-    std::string command = m_molalign + m_molalignarg + " molaign_ref.xyz   molalign_tar.xyz " + " 2>&1";
+    std::string command = m_molalign + m_molalignarg + " " + ref_tmp + "   " + tar_tmp + " 2>&1";
     if (m_verbosity >= 3)
         CurcumaLogger::info_fmt("MolAlign command: {}", command);
+#ifdef _WIN32
+    FileOpen = _popen(command.c_str(), "r");
+#else
     FileOpen = popen(command.c_str(), "r");
+#endif
     bool ok = true;
     bool rndm = false;
     bool error = false;
@@ -1625,17 +1699,22 @@ bool RMSDDriver::MolAlignLib()
             CurcumaLogger::debug(2, fmt::format("MolAlign output: {}", std::string(line).substr(0, std::string(line).find('\n'))));
 #endif
     }
+#ifdef _WIN32
+    _pclose(FileOpen);
+#else
     pclose(FileOpen);
+#endif
 
-    if (std::filesystem::exists("aligned.xyz") and !rndm) {
+    std::string aligned_tmp = outputPath("aligned.xyz");
+    if (std::filesystem::exists(aligned_tmp) && !rndm) {
         CurcumaLogger::citation("molalign");
-        FileIterator file("aligned.xyz", true);
+        FileIterator file(aligned_tmp, true);
         m_reference_centered = file.Next();
         m_target_reordered = file.Next();
         m_target_aligned = m_target_reordered;
         m_target = m_target_reordered;
         m_rmsd = CalculateRMSD();
-        std::filesystem::remove("aligned.xyz");
+        std::filesystem::remove(aligned_tmp);
     } else {
         if (!rndm && !error) {
             CurcumaLogger::error("Molalign was not found. Consider getting it from https://github.com/qcuaeh/molalignlib or use -molalignbin /yourpath/molalign");
@@ -1655,5 +1734,17 @@ bool RMSDDriver::MolAlignLib()
 
 Geometry RMSDDriver::Gradient() const
 {
+    // Claude Generated (Jun 2026): weighted gradient d(rmsd_w)/dx_i = w_i*(ref_i-tar_i)/(rmsd_w*Σw)
+    // when per-atom weights are set; otherwise the unweighted form (unchanged).
+    if (!m_rmsd_weights.empty()
+        && static_cast<int>(m_rmsd_weights.size()) == m_reference.getGeometry().rows()) {
+        Geometry g = m_reference.getGeometry() - m_target.getGeometry();
+        double wsum = 0.0;
+        for (double w : m_rmsd_weights)
+            wsum += w;
+        for (int i = 0; i < g.rows(); ++i)
+            g.row(i) *= m_rmsd_weights[i];
+        return g / (RMSD() * (wsum > 0 ? wsum : 1.0));
+    }
     return (m_reference.getGeometry() - m_target.getGeometry()) / (RMSD() * m_target.getGeometry().rows());
 }

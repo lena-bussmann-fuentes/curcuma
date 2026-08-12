@@ -25,6 +25,7 @@
 #include <functional>
 #include <random>
 #include <ratio>
+#include <unordered_map>
 
 #ifdef USE_Plumed
 #include "plumed2/src/wrapper/Plumed.h"
@@ -35,6 +36,7 @@
 #include "src/capabilities/rmsdtraj.h"
 
 #include "src/core/energycalculator.h"
+#include "src/core/intra_parallel_context.h"
 #include "src/core/molecule.h"
 
 #include "external/CxxThreadPool/include/CxxThreadPool.hpp"
@@ -51,12 +53,17 @@ struct BiasStructure {
     double energy = 0;
     double factor = 1;
     int index = 0;
-    int counter = 0;
+    double counter = 0; // Claude Generated (Jul 2026): soft residence-weighted height (strided scheme); was int visit count
+    double temperature = 0;  // Claude Generated (Apr 2026): deposition temperature for cross-T propagation
+    bool persistent = false; // Claude Generated (Jun 2026): fed-back optimised minimum; exempt from counter pruning
 };
+
+class SharedBiasPool;  // Claude Generated (Apr 2026): forward declaration
 
 class BiasThread : public CxxThread {
 public:
-    BiasThread(const Molecule& reference, const json& rmsdconfig, bool nocolvarfile, bool nohillsfile);
+    BiasThread(const Molecule& reference, const json& rmsdconfig, bool nocolvarfile, bool nohillsfile,
+               const std::string& colvar_base = "COLVAR");
     ~BiasThread();
 
     virtual int execute() override;
@@ -71,7 +78,7 @@ public:
         m_biased_structures.push_back(str);
         if (m_nocolvarfile == false) {
             std::ofstream colvarfile;
-            colvarfile.open("COLVAR_" + std::to_string(index));
+            colvarfile.open(m_colvar_base + "_" + std::to_string(index));
             colvarfile << "#m_currentStep  rmsd  bias_energy   counter  factor" << std::endl;
             colvarfile.close();
         }
@@ -105,15 +112,28 @@ public:
 
     inline Geometry Gradient() const { return m_gradient; }
     inline double RMSDReference() const { return m_rmsd_reference; }
+    // Exploration bias V(x) = Sum_i k*counter_i*exp(-alpha*RMSD_i^2): drives force + deposition.
     inline double BiasEnergy() const { return m_current_bias; }
+    // Optional well-tempered energy (opt-in, output only — never used for force/deposition).
+    inline double BiasEnergyWT() const { return m_current_bias_wt; }
     inline void setk(double k) { m_k = k; }
     inline void setalpha(double alpha) { m_alpha = alpha; }
-    inline void setDT(double DT) { m_DT = DT; }
-    inline void setdT(double dT) { m_dT = dT; }
+    inline void setDT(double DT) { m_DT = DT; } // well-tempered bias temperature Delta_T (K)
 
     inline void setEnergyConv(double rmsd_econv) { m_rmsd_econv = rmsd_econv; }
     inline void setWTMTD(bool wtmtd) { m_wtmtd = wtmtd; }
-    inline int Counter() const { return m_counter; }
+    // Claude Generated (Jul 2026): Gaussian-cutoff screen controls (see SimpleMD::m_rmsd_mtd_screen).
+    inline void setScreen(bool screen) { m_screen = screen; }
+    inline void setCutoffTol(double tol) { m_cutoff_tol = tol; }
+    inline void setScreenMargin(double margin) { m_screen_margin = margin; }
+    // Claude Generated (Jul 2026): strided scheme. soft = residence-weighted counter (delete gate);
+    // grow = whether this call is a deposit-stride step (counter grows only then).
+    inline void setSoftCounter(bool soft) { m_soft_counter = soft; }
+    inline void setGrowCounter(bool grow) { m_grow_counter = grow; }
+    inline double Counter() const { return m_counter; }
+    // Claude Generated (Jul 2026): hills screened/evaluated in the last execute() call.
+    inline int LastScreened() const { return m_last_screened; }
+    inline int LastEvaluated() const { return m_last_evaluated; }
     std::vector<BiasStructure> getBiasStructure() const { return m_biased_structures; }
     std::vector<json> getBias() const;
 
@@ -123,9 +143,22 @@ private:
     json m_config, m_constrained;
     Molecule m_reference, m_target;
     Geometry m_gradient;
-    double m_k, m_alpha, m_DT, m_currentStep, m_rmsd_reference, m_current_bias, m_rmsd_econv, m_dT = 1;
-    int m_counter = 0, m_atoms = 0;
+    double m_k, m_alpha, m_DT, m_currentStep, m_rmsd_reference, m_current_bias, m_rmsd_econv;
+    double m_current_bias_wt = 0; // well-tempered bias energy (opt-in, output only)
+    double m_counter = 0; // reported soft-counter sum (diagnostic only)
+    int m_atoms = 0;
+    // Claude Generated (Jul 2026): Gaussian-cutoff screen (see SimpleMD::m_rmsd_mtd_screen).
+    bool m_screen = true;
+    double m_cutoff_tol = 1.0e-8;
+    double m_screen_margin = 0.0;
+    std::vector<Eigen::Vector3d> m_sigma_cache;   // per-hill principal radii of gyration (sorted desc)
+    std::vector<Geometry> m_centered_cache;       // per-hill geometric-centered subset coords
+    std::vector<char> m_desc_ok;                  // filled flag per hill
+    int m_last_screened = 0, m_last_evaluated = 0; // hills skipped/computed in the last execute()
     bool m_wtmtd = false, m_nocolvarfile = false, m_nohillsfile = false;
+    bool m_soft_counter = false; // Claude Generated (Jul 2026): strided scheme -> counter += expr (gate deleted)
+    bool m_grow_counter = true;  // this call is a deposit-stride step
+    std::string m_colvar_base = "COLVAR";
 };
 
 // Claude Generated 2025: CurcumaMDJson removed - replaced by ParameterRegistry + ConfigManager
@@ -134,7 +167,7 @@ private:
 // Claude Generated 2025: Type-safe thermostat selection
 enum class ThermostatType {
     Berendsen,
-    Anderson,
+    Andersen,
     NoseHover,
     CSVR,
     None
@@ -170,15 +203,11 @@ public:
     */
     bool Initialise() override;
 
-    // Claude Generated 2026: Path for JSON restart files (inside .snapshots subdir when BMT active)
-    inline std::string snapshotPath(const std::string& filename) const {
-        return m_snapshots_dir.empty() ? outputPath(filename) : m_snapshots_dir + "/" + filename;
-    }
-    inline void setSnapshotsDir(const std::string& dir) { m_snapshots_dir = dir; }
-
     void start() override;
 
     std::vector<Molecule*> UniqueMolecules() const { return m_unique_structures; }
+    const Molecule& CurrentMolecule() const { return m_molecule; }  ///< Claude Generated: access final MD geometry
+    bool wasStable() const { return !m_unstable; }  ///< Claude Generated: check if MD completed without instability (NaN/Inf)
     void printHelp() const;
 
     /* ============================================================================
@@ -221,12 +250,42 @@ public:
     double currentTime() const { return m_currentStep; }
     const Molecule& currentMolecule() const { return m_molecule; }
 
+    /** Claude Generated (2026): set the thermostat target temperature live (Kelvin).
+     *  Safe to call between step() calls from the driving thread. Setting it marks the
+     *  run as manually overridden, so any active temperature ramp stops touching m_T0
+     *  for the rest of the run (manual control wins). */
+    void setTargetTemperature(double T)
+    {
+        m_T0 = T;
+        m_global_ramp.overridden = true;
+    }
+    /** Claude Generated (2026): current thermostat target temperature (Kelvin). Reflects
+     *  the live setpoint, including the value driven by an active temperature ramp. */
+    double targetTemperature() const { return m_T0; }
+
+    /** Claude Generated (2026): live-set the wall potential energy/temperature scale (K).
+     *  Applied before the next MD step without restarting. */
+    void setWallTemp(double T) { m_wall_temp = T; }
+    /** Claude Generated (2026): live-set the wall potential steepness parameter (β). */
+    void setWallBeta(double beta) { m_wall_beta = beta; }
+
+    // Claude Generated (Apr 2026): shared bias pool for parallel ConfSearch
+    void setSharedBiasPool(SharedBiasPool* pool) { m_shared_pool = pool; }
+
 private:
     std::function<void(void)> ThermostatFunction;
     void PrintStatus() const;
 
+    // Claude Generated 2026: Build path inside snapshots subdirectory
+    std::string snapshotPath(const std::string& filename) const {
+        if (m_snapshots_dir.empty())
+            return outputPath(filename);
+        return m_snapshots_dir + "/" + filename;
+    }
+
     /* Lets have this for all modules */
     virtual nlohmann::json WriteRestartInformation() override;
+    void writeMtdProvenance(); // Claude Generated (Jul 2026): mtd_hills/mtd_coverage CSV + gnuplot scripts
 
     /* Lets have this for all modules */
     virtual bool LoadRestartInformation() override;
@@ -257,7 +316,9 @@ private:
     void applyPeriodicBoundaryConditions();  // Claude Generated (Oct 2025): PBC wrapping
     void Verlet();
     void Rattle();
-    void ApplyRMSDMTD();
+    void EvaluateBias(bool do_deposit); // Claude Generated (Jul 2026): bias force -> m_bias_force_target
+    void ApplyHeldBias();               // apply held + smoothstep-interpolated bias force every step
+    bool gapGuardTriggered();           // Milestone 2: walker moved > r_dep since the last force eval
 
     void Rattle_Verlet_First(double* coord, double* grad);
     void Rattle_Constrain_First(double* coord, double* grad);
@@ -275,8 +336,41 @@ private:
     void Berendson();
     void CSVR();
     void None();
-    void Anderson();
+    void Andersen();
     void NoseHover();
+
+    // Claude Generated (2026): runtime temperature control / multi-stage ramp / regions.
+    struct RampSegment {
+        double target;                     ///< segment target temperature [K]
+        enum Mode { Steps, Reach } mode;   ///< Steps: ramp over N steps; Reach: hold until <T> reached
+        double value;                      ///< Steps: number of steps; Reach: tolerance [K]
+    };
+    /// One temperature schedule (global or per region) plus its running position.
+    struct RampState {
+        bool enabled = false;              ///< schedule active
+        bool overridden = false;           ///< a live setTargetTemperature() cancelled it (global only)
+        std::vector<RampSegment> schedule;
+        int idx = 0;                       ///< active segment
+        int seg_start_step = 0;            ///< m_step when the active segment began
+        double seg_start_T = 298.15;       ///< setpoint at the start of the active segment
+    };
+    /// A subset of atoms thermostatted to their own (optionally ramped) target temperature.
+    struct ThermalRegion {
+        std::string atoms_spec;            ///< selection string (FragString2Indicies grammar)
+        std::vector<int> atoms;            ///< resolved 0-based indices (set in prepareRun)
+        double T0 = 298.15;                ///< current setpoint (driven by ramp)
+        int dof = 0;                       ///< 3 * atoms.size()
+        RampState ramp;
+    };
+
+    bool ParseSchedule(const std::string& spec, std::vector<RampSegment>& out, const std::string& ctx);  ///< parse 'T:mode:val;...'
+    void StepRamp(RampState& rs, double& T0, double measuredT);  ///< advance one schedule by one step
+    void UpdateTemperatureRamp();                                ///< drive global + region setpoints (called each step)
+    void ParseThermalRegions();                                  ///< read temp_regions specs from the controller
+    void ResolveThermalRegions();                                ///< resolve atom indices + default complement (needs molecule)
+    double RegionTemperature(const std::vector<int>& atoms, int dof) const;  ///< instantaneous T of an atom subset
+    void ApplyThermostat();                                      ///< per-region dispatch (or legacy global path)
+    void ApplyThermostatRegion(const std::vector<int>& atoms, double T0, int dof, ThermostatType type);
 
     void InitialiseWalls();
 
@@ -295,7 +389,14 @@ private:
     std::vector<std::pair<std::pair<int, int>, double>> m_bond_constrained, m_bond_13_constrained;
 #ifdef USE_Plumed
     plumed m_plumedmain;
+    std::vector<double> m_plumed_positions;  // Positions in Bohr for PLUMED
+    double m_plumed_box[9] = {};             // Box vectors in Bohr for PLUMED (3x3 row-major)
+                                             // NOTE: Currently never populated — PBC/PLUMED periodic box is NOT supported.
+                                             // To enable: populate from lattice vectors when PBC is active, then call
+                                             // plumed_cmd("setBox", m_plumed_box) during PLUMED initialization.
 #endif
+
+    std::string m_snapshots_dir;  // Claude Generated 2026: Snapshots subdirectory inside BMT
 
     int m_natoms = 0;
     int m_dump = 1;
@@ -307,6 +408,11 @@ private:
     double m_dT = 0.5, m_currentStep = 0, m_maxtime = 1000;
     int m_spin = 0, m_charge = 0, m_print = 100;
     double m_T0 = 298.15, m_aver_Temp = 0, m_aver_rattle_Temp = 0, m_rmsd = 1.5;
+    // Claude Generated (Jun 2026): initial velocity sampling temperature. Set to
+    // -1 in the constructor and resolved against m_T0 in performMolecularDynamics
+    // so the thermostat target (m_T0) and the MB-sampling temperature can be
+    // controlled independently. -1 means "same as target temperature".
+    double m_T_init = -1.0;
     double m_x0 = 0, m_y0 = 0, m_z0 = 0;
     double m_Ekin_exchange = 0.0;
 //    std::vector<double> m_current_geometry, m_mass, m_velocities, m_gradient, m_rmass, m_virial, m_gradient_bias, m_scaling_vector_linear, m_scaling_vector_nonlinear, m_rt_geom_1, m_rt_geom_2, m_rt_velo;
@@ -337,11 +443,38 @@ private:
     bool m_run_aborted = false;          // mirrors former local `aborted` flag in start()
     std::vector<json> m_run_states;      // rescue states carried across step() calls
 
+    // Claude Generated (Jun 2026): ConfSearch robustness gates (opt-in, default off)
+    bool m_topo_check = false;           // abort on fragmentation; also gates bias deposition
+    int m_topo_check_interval = 0;       // user value (0 -> resolved to dump in prepareRun)
+    int m_topo_check_every = 0;          // resolved interval actually used in step()
+    int m_start_fragment_count = 1;      // connected-component count at run start (reference)
+    bool m_epot_abort = false;           // abort when running-mean potential climbs too high
+    double m_epot_abort_window = 250.0;  // kJ/mol above the starting energy
+    double m_epot_ref = 0.0;             // bare potential energy at run start (reference)
+    bool m_temp_abort = false;           // abort when running-mean temperature runs away from target
+    double m_temp_abort_factor = 1.5;    // abort if <T> > factor * T0 (<= 0 disables)
+    double m_temp_abort_delta = 300.0;   // abort if <T> > T0 + delta [K] (<= 0 disables)
+
+    // Claude Generated (2026): runtime temperature control + multi-stage ramp + regions.
+    // m_T0 is the global thermostat setpoint, read every step by the thermostats. The global
+    // ramp (m_global_ramp) drives m_T0 across its segments; a live setTargetTemperature() sets
+    // m_global_ramp.overridden, after which it leaves m_T0 alone for the rest of the run.
+    // Each ThermalRegion thermostats its own atom subset to its own (optionally ramped) target;
+    // atoms in no region (m_default_region_atoms) follow the global setpoint.
+    bool m_temp_ramp = false;                       // global ramp enable (PARAM temp_ramp)
+    RampState m_global_ramp;                         // global schedule state
+    std::vector<ThermalRegion> m_thermal_regions;    // optional per-atom-subset thermostats
+    std::vector<int> m_default_region_atoms;         // atoms in no region (complement; resolved in prepareRun)
+    int m_default_region_dof = 0;                    // 3 * m_default_region_atoms.size()
+
     std::vector<Geometry> m_bias_structures;
     std::vector<BiasStructure> m_biased_structures;
     std::vector<BiasThread*> m_bias_threads;
     json m_bias_json;
     CxxThreadPool* m_bias_pool;
+    SharedBiasPool* m_shared_pool = nullptr;  // Claude Generated (Apr 2026): shared bias pool for parallel ConfSearch
+    RMSDDriver m_shared_pool_driver;  // Claude Generated (Apr 2026): local RMSDDriver for shared pool path
+    Molecule m_shared_pool_target;  // Claude Generated (Apr 2026): target molecule for shared pool RMSD
     int m_unix_started = 0, m_prev_index = 0, m_max_rescue = 10, m_current_rescue = 0, m_currentTime = 0, m_max_top_diff = 15, m_step = 0;
     int m_writerestart = -1;
     int m_respa = 1;
@@ -354,15 +487,54 @@ private:
     double m_wall_potential = 0, m_average_wall_potential = 0;
     double m_virial_correction = 0, m_average_virial_correction = 0;
     double m_deltaT = 0;
-    double m_k_rmsd = 0.1;
+    double m_k_rmsd = 0.01;
     double m_alpha_rmsd = 10;
     double m_bias_energy = 1e8;
     double m_rmsd_rmsd = 1;
     double m_rmsd_econv = 1e8;
-    double m_rmsd_DT = 1000000;
+    double m_rmsd_DT = 2000; // well-tempered bias temperature Delta_T (K), used only when wtmtd=true
     double m_rattle_max = 10;
     double m_rattle_min = 1e-4;
     int m_max_rmsd_N = -1;
+    int m_rmsd_mtd_max_height = 0;       // Claude Generated (Jun 2026): cap on counter used in W_i (0 = unbounded)
+    bool m_freeze_inherited = false;     // Claude Generated (Jun 2026): freeze heights of structures inherited at run start
+    std::unordered_map<int, double> m_frozen_height; // index -> frozen counter for inherited bias structures
+    // Claude Generated (Jul 2026): RMSD-MTD Gaussian-cutoff screen. Skip a bias hill before its
+    // Kabsch/gradient when a rigorous, rotation/translation-invariant RMSD lower bound (principal
+    // radii of gyration of the RMSD subset; Mirsky's inequality) proves its Gaussian is negligible.
+    bool m_rmsd_mtd_screen = true;
+    double m_rmsd_mtd_cutoff_tol = 1.0e-8;   // Gaussian value below which a hill is treated as zero
+    double m_rmsd_mtd_screen_margin = 0.0;   // extra safety radius added to the cutoff (RMSD length units)
+    // Per-walker lazy descriptor cache, keyed by BiasStructure::index (stable within one MD run:
+    // deposits only append; pruning re-indexes only between runs -> invalidated at Initialise()).
+    std::vector<Eigen::Vector3d> m_hill_sigma;   // principal radii of gyration (sorted desc) of the subset
+    std::vector<Geometry> m_hill_centered;       // geometric-centered RMSD-subset coordinates
+    std::vector<char> m_hill_desc_ok;            // filled flag per hill index
+    // Claude Generated (Jul 2026): strided scheme (replaces counter/econv). docs/RMSD_MTD_TEXTBOOK.md.
+    std::string m_rmsd_mtd_scheme = "strided";
+    double m_r_dep = -1.0;                // hill spacing (Angstrom); <0 -> auto FWHM(alpha)
+    double m_vmin = 0.0;                  // deposition floor k*exp(-alpha*r_dep^2)
+    double m_transition_fraction = 1.0;   // Milestone 2 force-ramp length (fraction of stride)
+    int m_deposit_stride_steps = 1;       // deposit_stride_fs / time_step, >= 1
+    int m_last_deposit_eval_step = -1;    // last step the deposition/counter test ran
+    bool m_gap_guard = true;              // Milestone 2 displacement trigger
+    bool m_rmsd_mtd_diag = true;          // write provenance CSV + gnuplot
+    // Held-force buffers: bias-force CONTRIBUTION only (natoms x 3), not serialized. M1 uses weight 1.
+    Geometry m_bias_force_old, m_bias_force_target;
+    double m_bias_energy_target = 0.0;    // exact V(x) at the last evaluation
+    int m_bias_ramp_start_step = -1;      // step of the last F_target recompute
+    Geometry m_last_eval_subset;          // RMSD-subset geometry at the last force eval (gap guard)
+    RMSDDriver m_gap_driver;              // Milestone 2 gap guard: one Kabsch/step to the last-eval geom
+    Molecule m_gap_ref, m_gap_tgt;
+    // Claude Generated (Jul 2026): provenance log, one record per deposited hill (writeMtdProvenance).
+    struct MtdDepositRecord {
+        int index = 0;
+        double step = 0, time_fs = 0, energy = 0, rmsd_ref = 0;
+        char trigger = 'B'; // 'I' initial, 'B' bias<V_min, 'D' displacement (Milestone 2)
+        int cycle = 0;
+        bool persistent = false;
+    };
+    std::vector<MtdDepositRecord> m_mtd_deposits;
     int m_mtd_steps = 10;
     int m_rattle = 0;
     int m_colvar_incr = 0;
@@ -382,7 +554,6 @@ private:
     Matrix m_topo_initial;
     std::vector<Molecule*> m_unique_structures;
     std::string m_method = "UFF", m_initfile = "none", m_thermostat = "csvr", m_plumed, m_rmsd_ref_file, m_rmsd_atoms = "-1", m_scaling_json = "none";
-    std::string m_snapshots_dir;  // Claude Generated 2026: path for JSON restart files (.snapshots inside BMT)
     bool m_unstable = false;
     bool m_dipole = false;
     bool m_clean_energy = false;
@@ -412,6 +583,8 @@ private:
     int m_time_step = 0;
     int m_dof = 0;
     int m_mtd_time = 0, m_loop_time = 0;
+    // Claude Generated (Jul 2026): RMSD-MTD screen accounting (Kabsch fits done vs skipped over the run).
+    long long m_bias_hills_evaluated = 0, m_bias_hills_screened = 0;
 
     std::vector<std::vector<double>> m_atom_temp;
     std::vector<double> m_zeta; // Thermostatische Variablen
@@ -421,7 +594,7 @@ private:
 
     int m_chain_length = 3; // Länge der Thermostatkette
 
-    double m_anderson = 0.01;
+    double m_andersen = 0.01;
 
     std::vector<std::pair<double, double>> m_rattle_tol_temp;
 
@@ -452,6 +625,7 @@ private:
     // --- Basic Simulation Parameters ---
     PARAM(method, String, "uff", "Energy calculation method (e.g., uff, gfn2).", "Basic", {})
     PARAM(temperature, Double, 298.15, "Target temperature in Kelvin.", "Basic", {"T"})
+    PARAM(initial_temperature, Double, -1.0, "Initial temperature for velocity sampling (K). -1: same as 'temperature'. Use this to anneal into the target or to start cold/warm; the thermostat still drives toward 'temperature'. Ignored on restart (velocities come from the restart file).", "Basic", {"T_init", "T0", "initT"})
     PARAM(time_step, Double, 1.0, "Integration time step in femtoseconds.", "Basic", {"dt"})
     PARAM(max_time, Double, 1000.0, "Maximum simulation time in femtoseconds.", "Basic", {"MaxTime"})
     PARAM(charge, Int, 0, "Total charge of the system.", "Basic", {})
@@ -460,14 +634,14 @@ private:
     PARAM(threads, Int, 1, "Number of parallel threads.", "Basic", {})
 
     // --- Thermostat ---
-    PARAM(thermostat, String, "csvr", "Thermostat type: berendsen|anderson|nosehover|csvr|none.", "Thermostat", {})
+    PARAM(thermostat, String, "csvr", "Thermostat type: berendsen|andersen|nosehover|csvr|none.", "Thermostat", {})
     PARAM(coupling, Double, 10.0, "Thermostat coupling time in fs.", "Thermostat", {})
-    PARAM(anderson_probability, Double, 0.001, "Anderson thermostat collision probability.", "Thermostat", {"anderson"})
+    PARAM(andersen_probability, Double, 0.001, "Andersen thermostat collision probability.", "Thermostat", {})
     PARAM(chain_length, Int, 3, "Chain length for Nosé-Hoover thermostat.", "Thermostat", {"chainlength"})
 
     // --- System Control ---
     PARAM(remove_com_motion, Double, 100.0, "Remove translation/rotation every N fs.", "System", {"rm_COM"})
-    PARAM(remove_com_mode, Int, 3, "Removal mode (0:none, 1:trans, 2:rot, 3:both).", "System", {"rmrottrans"})
+    PARAM(remove_com_mode, Int, 1, "Removal mode (0:none, 1:trans only, 2:rot only, 3:both). Rotation removal is opt-in (use 2 or 3).", "System", {"rmrottrans"})
     PARAM(no_center, Bool, false, "Disable centering of the molecule at the origin.", "System", {"nocenter"})
     PARAM(use_com, Bool, false, "Use center of mass (otherwise geometric center).", "System", {"COM"})
     PARAM(hydrogen_mass, Int, 1, "Hydrogen mass scaling factor for HMR.", "System", {"hmass"})
@@ -509,13 +683,25 @@ private:
 
     // --- RMSD-based Metadynamics (Internal) ---
     PARAM(rmsd_mtd, Bool, false, "Enable internal RMSD-based metadynamics.", "RMSD-MTD", {})
-    PARAM(rmsd_mtd_k, Double, 0.1, "Force constant for RMSD bias.", "RMSD-MTD", {"k_rmsd"})
+    PARAM(rmsd_mtd_k, Double, 0.01, "Hill-height constant: bias height W_i = k * counter_i (Eh). The force is the exact gradient of the bias, so k is ~100x smaller than the pre-2026 value.", "RMSD-MTD", {"k_rmsd"})
     PARAM(rmsd_mtd_alpha, Double, 10.0, "Width parameter for RMSD Gaussians.", "RMSD-MTD", {"alpha_rmsd"})
-    PARAM(rmsd_mtd_pace, Int, 1, "Add a new bias potential every N steps.", "RMSD-MTD", {"mtd_steps"})
+    PARAM(rmsd_mtd_pace, Int, 1, "DEPRECATED and ignored under the strided scheme (use rmsd_mtd_deposit_stride). Only honoured by rmsd_mtd_scheme=legacy.", "RMSD-MTD", {"mtd_steps"})
     PARAM(rmsd_mtd_max_gaussians, Int, -1, "Maximum number of stored bias structures.", "RMSD-MTD", {"max_rmsd_N"})
     PARAM(rmsd_mtd_ref_file, String, "none", "File with reference structures for RMSD-MTD.", "RMSD-MTD", {"rmsd_ref_file"})
     PARAM(rmsd_mtd_atoms, String, "-1", "Atom indices to use for RMSD calculation.", "RMSD-MTD", {"rmsd_atoms"})
-    PARAM(rmsd_mtd_dt, Double, 1000000.0, "RMSD-MTD bias deposition time.", "RMSD-MTD", {"rmsd_DT"})
+    PARAM(rmsd_mtd_dt, Double, 2000.0, "Well-tempered bias temperature Delta_T (K). Only used when wtmtd=true, and only for the reported well-tempered energy -- it never affects the force or the exploration.", "RMSD-MTD", {"rmsd_DT"})
+    PARAM(rmsd_mtd_max_height, Int, 0, "Cap the per-structure hill counter used in the bias force: W_i = k * min(counter_i, cap). 0 = unbounded (legacy). Stops the shared bias pool from heating the dynamics over many runs (counter_i grows on every visit).", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_freeze_inherited, Bool, false, "Freeze the hill heights of bias structures already present at this MD run's start; only structures deposited during this run gain height. Bounds the cumulative bias force across successive shared-pool runs (geometry sharing is preserved).", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_screen, Bool, true, "Skip bias hills whose Gaussian contribution is provably negligible, using a rotation/translation-invariant RMSD lower bound (principal radii of gyration of the RMSD subset) plus a Gaussian cutoff. Physics-preserving: energy, force and the visited set are unaffected. false = evaluate every hill (legacy).", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_cutoff_tol, Double, 1.0e-8, "Gaussian tolerance for rmsd_mtd_screen: a hill is skipped when its lower-bound exp(-alpha*RMSD^2) falls below this (further tightened to global_count/rmsd_econv so the deposition/visited bookkeeping is preserved). Smaller = more conservative (closer to legacy).", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_screen_margin, Double, 0.0, "Extra safety radius (RMSD length units) added to the screen cutoff. 0 relies on the rigorous lower bound; increase only when experimenting with heuristic descriptors.", "RMSD-MTD", {})
+    // --- Strided scheme (Jul 2026, replaces counter/econv). See docs/RMSD_MTD_TEXTBOOK.md ---
+    PARAM(rmsd_mtd_scheme, String, "strided", "RMSD-MTD deposition scheme: 'strided' (interpretable V_min spacing, soft residence counter, deposition on a fs cadence) or 'legacy' (pre-2026 counter/econv scheme, kept transiently for A/B validation).", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_deposit_stride, Double, 10.0, "Strided scheme: deposition / counter-growth cadence in fs (converted to steps via time_step). The bias force still acts every step. Structures change slowly, so 10-20 fs is enough.", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_transition_fraction, Double, 1.0, "Strided scheme (Milestone 2): force-ramp length as a fraction of deposit_stride, in (0,1]. 1.0 glides continuously. Unused while the force is evaluated every step.", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_r_dep, Double, -1.0, "Strided scheme: hill spacing in RMSD space (Angstrom) setting V_min = k*exp(-alpha*r_dep^2). -1 = auto FWHM(alpha) = 2.3548/sqrt(2*alpha) (0.5 A at alpha=10).", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_gap_guard, Bool, true, "Strided scheme (Milestone 2): force an early deposition test when the walker moves > r_dep from the last deposited hill within a stride (closes coverage gaps). Inert while the force is evaluated every step.", "RMSD-MTD", {})
+    PARAM(rmsd_mtd_diag, Bool, true, "Write RMSD-MTD provenance diagnostics (basename.mtd_hills / mtd_coverage CSV + gnuplot scripts) via the BMT output path at verbosity>=1. false = COLVAR only.", "RMSD-MTD", {})
 
     // --- Coarse Graining (CG) Parameters --- Claude Generated (Nov 2025)
     PARAM(cg_write_vtf, Bool, true, "Write VTF trajectory for CG systems.", "CG", {"write_vtf"})
@@ -526,6 +712,19 @@ private:
     PARAM(md_diagnostics, Bool, false, "Write per-step diagnostics to <basename>.diag.jsonl (energy decomposition, charges, CN, gradient norms, HB/XB counts). Frequency follows dump_frequency. One JSON object per line.", "Output", {})
     // --- WP-P1 Timing Instrumentation (May 2026) ---
     PARAM(md_diagnostics_timing, Bool, false, "Add a timing_ms block to each <basename>.diag.jsonl record (per-phase wall-clock: CN/EEQ/dcn/D4-weights/FF/integrator/HBXB/I-O). GPU runs add a gpu sub-block with per-kernel-category times. Requires md_diagnostics=true. ~1-2 us per hook.", "Output", {})
+
+    // --- ConfSearch robustness gates (Jun 2026, Claude Generated) ---
+    PARAM(topo_check, Bool, false, "Abort the MD run when the molecule fragments (number of connected components grows above the start value). Off by default so reactive paths are still sampled.", "ConfSearch", {})
+    PARAM(topo_check_interval, Int, 0, "Steps between topology checks (0 -> use dump_frequency).", "ConfSearch", {})
+    PARAM(epot_abort, Bool, false, "Abort the MD run when the running-mean potential energy climbs more than epot_abort_window above the run's starting energy.", "ConfSearch", {})
+    PARAM(epot_abort_window, Double, 250.0, "Energy window (kJ/mol) above the starting energy for epot_abort. Must exceed the thermal baseline (~N_dof*kT/2) plus typical barriers.", "ConfSearch", {})
+    PARAM(temp_abort, Bool, false, "Abort the MD run when the running-mean temperature runs away from the target (catches bias-driven heating). Uses temp_abort_factor and/or temp_abort_delta.", "ConfSearch", {})
+    PARAM(temp_abort_factor, Double, 1.5, "Abort when <T> exceeds temp_abort_factor * target T. <= 0 disables this threshold. Only active when temp_abort=true.", "ConfSearch", {})
+    PARAM(temp_abort_delta, Double, 300.0, "Abort when <T> exceeds (target T + temp_abort_delta) Kelvin. <= 0 disables this threshold. Only active when temp_abort=true.", "ConfSearch", {})
+
+    // --- Temperature Ramp (Jun 2026, Claude Generated) ---
+    PARAM(temp_ramp, Bool, false, "Enable a multi-stage temperature ramp schedule (see temp_schedule). A live GUI slider / setTargetTemperature() overrides it for the rest of the run.", "Temperature Ramp", {})
+    PARAM(temp_schedule, String, "", "Ramp schedule 'target:mode:value;...'. mode=steps ramps the setpoint linearly from the previous target to <target> over <value> integration steps; mode=reach jumps the setpoint to <target> and advances once |<T>-target| < value Kelvin. Example: '500:steps:5000;500:steps:2000;300:reach:10'.", "Temperature Ramp", {})
 
     END_PARAMETER_DEFINITION
     // ^^^^^^^^^^^^ PARAMETER DEFINITION BLOCK ^^^^^^^^^^^^
@@ -549,31 +748,35 @@ public:
     {
         setAutoDelete(true);
     }
-    ~MDThread() = default;
+    ~MDThread() { delete m_mddriver; }
     void setBasename(const std::string& basename) { m_basename = basename; }
     inline void setMolecule(const Molecule& molecule) { m_molecule = molecule; }
     SimpleMD* MDDriver() const { return m_mddriver; }
 
+    // Claude Generated (Apr 2026): shared bias pool for parallel ConfSearch
+    void setSharedBiasPool(SharedBiasPool* pool) { m_shared_pool = pool; }
+
+    // Claude Generated (Jul 2026): completion hook for the ConfSearch verbosity-1 run counter.
+    // Invoked from the worker thread once the MD finishes, with the run wall-time in seconds.
+    // Formatting/serialisation lives in the caller (ConfSearch) so it can bypass the global
+    // logger level, which is unreliable across pool workers.
+    void setOnComplete(std::function<void(double)> cb) { m_on_complete = std::move(cb); }
+
     virtual int execute() override
     {
-        json controller;
-        controller["md"] = m_controller;
-        m_mddriver = new SimpleMD(controller, false);
+        // One MD run among many under a molecule-level pool: keep intra-molecule
+        // fan-out suppressed so methods that honor the flag stay serial.
+        curcuma::SuppressIntraParallel intra_guard;
+
+        const auto t0 = std::chrono::steady_clock::now();
+        m_mddriver = new SimpleMD(m_controller, false);
         m_mddriver->setMolecule(m_molecule);
         m_mddriver->overrideBasename(m_basename + ".t" + std::to_string(getThreadId()));
-        // Claude Generated 2026: Keep m_output_dir at BMT root, create snapshots subdir for JSON restarts
-        if (m_mddriver->OutputDir().empty()) {
-            m_mddriver->setOutputDir(m_mddriver->Basename() + ".snapshots");
-        } else {
-            m_mddriver->setSnapshotsDir(m_mddriver->outputPath(m_mddriver->Basename() + ".snapshots"));
-#ifdef C17
-#ifndef _WIN32
-            std::filesystem::create_directories(m_mddriver->snapshotPath(""));
-#endif
-#endif
-        }
+        m_mddriver->setSharedBiasPool(m_shared_pool);
         m_mddriver->Initialise();
         m_mddriver->start();
+        if (m_on_complete)
+            m_on_complete(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         return 0;
     }
 
@@ -583,4 +786,6 @@ protected:
     std::string m_result;
     json m_controller;
     SimpleMD* m_mddriver;
+    SharedBiasPool* m_shared_pool = nullptr;  // Claude Generated (Apr 2026)
+    std::function<void(double)> m_on_complete; // Claude Generated (Jul 2026): run-completion hook
 };
