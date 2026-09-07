@@ -1,6 +1,6 @@
 /*
  * <Simple MD Module for Curcuma. >
- * Copyright (C) 2023 - 2024 Conrad Hübler <Conrad.Huebler@gmx.net>
+ * Copyright (C) 2023 - 2026 Conrad Hübler <Conrad.Huebler@gmx.net>
  *               2024 Gerd Gehrisch
  *
  * This program is free software: you can redistribute it and/or modify
@@ -22,6 +22,7 @@
 
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <functional>
 #include <random>
 #include <ratio>
@@ -235,6 +236,13 @@ private:
         return m_mtd_dir + "/" + filename;
     }
 
+    // Claude Generated 2026: Build path inside plumed-files subdirectory
+    std::string plumedPath(const std::string& filename) const {
+        if (m_plumed_dir.empty())
+            return outputPath(filename);
+        return m_plumed_dir + "/" + filename;
+    }
+
     /* Lets have this for all modules */
     virtual nlohmann::json WriteRestartInformation() override;
 
@@ -314,6 +322,7 @@ private:
 
     std::string m_snapshots_dir;  // Claude Generated 2026: Snapshots subdirectory inside BMT
     std::string m_mtd_dir;        // Claude Generated 2026: RMSD-MTD subdirectory inside BMT
+    std::string m_plumed_dir;     // Claude Generated 2026: PLUMED output subdirectory inside BMT
 
     int m_natoms = 0;
     int m_dump = 1;
@@ -335,6 +344,9 @@ private:
     Molecule m_molecule, m_reference, m_target, m_rmsd_mtd_molecule;
     ConfigManager m_config;  // Claude Generated - Modern type-safe parameter access
     bool m_initialised = false, m_restart = false, m_writeUnique = true, m_opt = false, m_rescue = false, m_writeXYZ = true, m_writeinit = false, m_norestart = false;
+    bool m_write_csv = true;                 // Claude Generated 2026: enable CSV status output
+    std::string m_csv_delimiter = ";";       // Claude Generated 2026: CSV field delimiter
+    mutable std::ofstream m_csv_file;        // Claude Generated 2026: CSV status stream (mutable: written from const PrintStatus)
     int m_rmrottrans = 0, m_rattle_maxiter = 100;
     bool m_nocenter = false;
     bool m_COM = false;
@@ -404,6 +416,7 @@ private:
     bool m_dipole = false;
     bool m_clean_energy = false;
     bool m_mtd = false;
+    bool m_no_plumed_redirect = false;  // Claude Generated 2026: Disable automatic PLUMED output routing
     bool m_eval_mtd = true;
     bool m_rmsd_mtd = false;
     bool m_wtmtd = false;
@@ -523,6 +536,7 @@ private:
     // --- Metadynamics (PLUMED) ---
     PARAM(mtd, Bool, false, "Enable PLUMED metadynamics.", "Metadynamics", {})
     PARAM(plumed_file, String, "plumed.dat", "PLUMED input file.", "Metadynamics", {"plumed"})
+    PARAM(no_plumed_redirect, Bool, false, "Disable automatic routing of PLUMED output files into BMT/plumed-files subdirectory. When false (default), FILE= paths in plumed.dat are rewritten to point into BMT/plumed-files/.", "Metadynamics", {})
 
     // --- RMSD-based Metadynamics (Internal) ---
     PARAM(rmsd_mtd, Bool, false, "Enable internal RMSD-based metadynamics.", "RMSD-MTD", {})
@@ -533,6 +547,7 @@ private:
     PARAM(rmsd_mtd_ref_file, String, "none", "File with reference structures for RMSD-MTD.", "RMSD-MTD", {"rmsd_ref_file"})
     PARAM(rmsd_mtd_atoms, String, "-1", "Atom indices to use for RMSD calculation.", "RMSD-MTD", {"rmsd_atoms"})
     PARAM(rmsd_mtd_dt, Double, 1000000.0, "RMSD-MTD bias deposition time.", "RMSD-MTD", {"rmsd_DT"})
+    PARAM(rmsd_econv, Double, 1e8, "Energy convergence threshold for bias structure addition. Lower = more frequent structure addition (aggressive); higher = rarer addition (conservative). Default effectively disables the filter.", "RMSD-MTD", {})
     PARAM(wtmtd, Bool, false, "Enable well-tempered metadynamics (adaptive bias deposition).", "RMSD-MTD", {})
 
     // --- Coarse Graining (CG) Parameters --- Claude Generated (Nov 2025)
@@ -544,6 +559,10 @@ private:
     PARAM(md_diagnostics, Bool, false, "Write per-step diagnostics to <basename>.diag.jsonl (energy decomposition, charges, CN, gradient norms, HB/XB counts). Frequency follows dump_frequency. One JSON object per line.", "Output", {})
     // --- WP-P1 Timing Instrumentation (May 2026) ---
     PARAM(md_diagnostics_timing, Bool, false, "Add a timing_ms block to each <basename>.diag.jsonl record (per-phase wall-clock: CN/EEQ/dcn/D4-weights/FF/integrator/HBXB/I-O). GPU runs add a gpu sub-block with per-kernel-category times. Requires md_diagnostics=true. ~1-2 us per hook.", "Output", {})
+
+    // --- CSV Status Output (Claude Generated 2026) ---
+    PARAM(write_csv, Bool, true, "Write per-step energies/temperatures to <basename>.md.csv in the output directory.", "Output", {})
+    PARAM(csv_delimiter, String, ";", "Delimiter for the CSV status file (e.g. ';', ',', or '\\t' for tab).", "Output", {})
 
     END_PARAMETER_DEFINITION
     // ^^^^^^^^^^^^ PARAMETER DEFINITION BLOCK ^^^^^^^^^^^^

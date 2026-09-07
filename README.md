@@ -625,6 +625,8 @@ curcuma -md input.xyz -mtd -plumed plumed.dat
 
 See [docs/PLUMED_HELP.md](docs/PLUMED_HELP.md) for the full PLUMED integration guide (unit conversions, output files, available CVs, thermal equilibration gate, internal RMSD-MTD).
 
+Per-step energies and temperatures are also written to a UTF-8 CSV file (`<basename>.md.csv`) in the BMT output directory, readable directly by spreadsheet programs. See [docs/MD_CSV_OUTPUT.md](docs/MD_CSV_OUTPUT.md).
+
 ## Output Directory System (BMT)
 
 By default, all curcuma commands create a **Basename.Method.Timestamp** directory for their output files. For example:

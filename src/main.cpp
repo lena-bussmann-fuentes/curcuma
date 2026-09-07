@@ -2014,6 +2014,13 @@ static void printMetadynamicsHelp()
     std::cout << "                              Only used when -wtmtd true." << std::endl;
     std::cout << "                              Lower values = stronger adaptive rescaling." << std::endl;
     std::cout << "                              Typical: 10-1000." << std::endl;
+    std::cout << "  -rmsd_econv <double>         Energy convergence threshold (default: 1e8)" << std::endl;
+    std::cout << "                              Controls when new bias structures are added." << std::endl;
+    std::cout << "                              Lower values = more frequent structure addition" << std::endl;
+    std::cout << "                                (aggressive sampling, more reference structures)." << std::endl;
+    std::cout << "                              Higher values = rarer addition" << std::endl;
+    std::cout << "                                (conservative, fewer reference structures)." << std::endl;
+    std::cout << "                              Default (1e8) effectively disables the filter." << std::endl;
     std::cout << std::endl;
 
     std::cout << "WELL-TEMPERED MTD" << std::endl;

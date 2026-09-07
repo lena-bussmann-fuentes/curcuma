@@ -56,6 +56,7 @@ capabilities/
   - ✅ 10x timestep scaling for pure CG systems
   - ✅ VTF trajectory output for CG systems
   - ✅ Orientational dynamics infrastructure (prepared for Phase 6 ellipsoids)
+  - ✅ CSV status output — per-step energies/temperatures to `<basename>.md.csv` in BMT dir (UTF-8, configurable delimiter) — see [docs/MD_CSV_OUTPUT.md](../../docs/MD_CSV_OUTPUT.md)
 - **NEB Docking**: Nudged elastic band for transition state searches
 - **Trajectory Analysis**: Analysis tools for MD trajectories
 
@@ -70,6 +71,8 @@ capabilities/
 - **`initializeBMT()`** (main.cpp): Helper that calls `setFile()`, `createBMTDir()`, and registers `-bak` files
 - **`addBakFile()`** / **`processBakFiles()`**: Register and copy files back to CWD after calculation
 - **`outputPath()`**: Route all output through BMT directory when set; returns bare filename when BMT is disabled
+- **Subdirectories**: SimpleMD creates `Basename.snapshots/`, `Basename.rmsd_mtd/`, and `Basename.plumed_files/` inside BMT
+- **PLUMED output routing** (🤖 AI-generated, not yet ✅ TESTED): `FILE=` paths in plumed.dat are rewritten to point into `Basename.plumed_files/`; provenance copy saved as `Basename.plumed.dat`; `-no_plumed_redirect` disables
 - **Commands using BMT**: md, opt, hessian, qmdfffit, confsearch, confscan, confstat, dock, analysis, rmsd
 - **Standalone BMT**: `BMTUtils::` functions used directly for analysis/rmsd (non-CurcumaMethod handlers)
 - **Status**: 🤖 AI-generated, machine-tested — human production testing pending

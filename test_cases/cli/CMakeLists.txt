@@ -122,6 +122,8 @@ add_cli_test(simplemd 11_diagnostics_dump)
 set_tests_properties(cli_simplemd_11_diagnostics_dump PROPERTIES TIMEOUT 180 LABELS "simplemd;gfnff;diagnostics")
 add_cli_test(simplemd 12_eeq_cutoff_auto)
 set_tests_properties(cli_simplemd_12_eeq_cutoff_auto PROPERTIES TIMEOUT 180 LABELS "simplemd;gfnff;eeq_cutoff")
+add_cli_test(simplemd 13_csv_output)
+set_tests_properties(cli_simplemd_13_csv_output PROPERTIES TIMEOUT 120 LABELS "simplemd;uff;csv")
 
 # =============================================================================
 # CG (Coarse Graining) Tests — disabled: -vtf command not implemented in main.cpp

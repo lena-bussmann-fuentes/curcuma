@@ -1,6 +1,6 @@
 /*
  * <Simple MD Module for Cucuma. >
- * Copyright (C) 2020 - 2024 Conrad Hübler <Conrad.Huebler@gmx.net>
+ * Copyright (C) 2020 - 2026 Conrad Hübler <Conrad.Huebler@gmx.net>
  *               2024 Gerd Gehrisch
  *
  * This program is free software: you can redistribute it and/or modify
@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <sstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -211,6 +212,8 @@ void SimpleMD::LoadControlJson()
     m_COM = m_config.get<bool>("use_com");
     m_dump = m_config.get<int>("dump_frequency");
     m_print = m_config.get<int>("print_frequency");
+    m_write_csv = m_config.get<bool>("write_csv");
+    m_csv_delimiter = m_config.get<std::string>("csv_delimiter");
     m_max_top_diff = m_config.get<int>("MaxTopoDiff", 15);  // Not in PARAM block, using default
     m_seed = m_config.get<int>("seed");
     m_threads = m_config.get<int>("threads");
@@ -241,7 +244,7 @@ void SimpleMD::LoadControlJson()
     m_chain_length = m_config.get<int>("chain_length");
     m_rmsd_rmsd = m_config.get<double>("rmsd_rmsd", 1.0);  // Not in PARAM block - legacy
     m_max_rmsd_N = m_config.get<int>("rmsd_mtd_max_gaussians");
-    m_rmsd_econv = m_config.get<double>("rmsd_econv", 1e8);  // Not in PARAM block - legacy
+    m_rmsd_econv = m_config.get<double>("rmsd_econv");
     m_rmsd_DT = m_config.get<double>("rmsd_mtd_dt");
     m_wtmtd = m_config.get<bool>("wtmtd");
     m_rmsd_ref_file = m_config.get<std::string>("rmsd_mtd_ref_file");
@@ -260,6 +263,7 @@ void SimpleMD::LoadControlJson()
     m_writeXYZ = m_config.get<bool>("write_xyz");
     m_writeinit = m_config.get<bool>("write_initial_state");
     m_mtd = m_config.get<bool>("mtd");
+    m_no_plumed_redirect = m_config.get<bool>("no_plumed_redirect");
     m_mtd_dT = m_config.get<int>("mtd_dT", -1);  // Not in PARAM block - legacy
     if (m_mtd_dT < 0) {
         m_eval_mtd = true;
@@ -445,6 +449,16 @@ bool SimpleMD::Initialise()
 #ifdef C17
 #ifndef _WIN32
         std::filesystem::create_directories(m_mtd_dir);
+#endif
+#endif
+    }
+
+    // Claude Generated 2026: Create .plumed_files subdirectory inside BMT for PLUMED output
+    if (m_mtd && !m_no_plumed_redirect && !OutputDir().empty()) {
+        m_plumed_dir = outputPath(Basename() + ".plumed_files");
+#ifdef C17
+#ifndef _WIN32
+        std::filesystem::create_directories(m_plumed_dir);
 #endif
 #endif
     }
@@ -1678,6 +1692,61 @@ void SimpleMD::prepareRun()
 
     WriteGeometry();
 #ifdef USE_Plumed
+    // Claude Generated 2026: Rewrite FILE= paths in plumed.dat content to route output into BMT/plumed-files.
+    // PLUMED's FILE= directives (e.g. FILE=COLVAR, FILE=HILLS) write to CWD by default.
+    // When BMT is active and -no_plumed_redirect is not set, this function prepends the
+    // plumed-files subdirectory path to each FILE= value, so all PLUMED output lands in
+    // BMT/Basename.plumed_files/ instead of cluttering CWD.
+    // Absolute paths and paths already containing '/' are left unchanged.
+    auto rewritePlumedDatPaths = [](const std::string& content, const std::string& plumed_dir) -> std::string {
+        if (plumed_dir.empty())
+            return content;
+
+        std::string result;
+        std::istringstream stream(content);
+        std::string line;
+        while (std::getline(stream, line)) {
+            size_t pos = 0;
+            while ((pos = line.find("FILE=", pos)) != std::string::npos) {
+                // Don't match FILE= inside a word (e.g. PROFILE=)
+                if (pos > 0 && std::isalpha(static_cast<unsigned char>(line[pos - 1]))) {
+                    pos += 5; // skip past "FILE=" and continue searching
+                    continue;
+                }
+                size_t value_start = pos + 5; // past "FILE="
+                // Handle quoted values: FILE="name"
+                bool quoted = false;
+                if (value_start < line.size() && line[value_start] == '"') {
+                    quoted = true;
+                    value_start++;
+                }
+                // Find end of filename (whitespace, comma, closing quote, or end of line)
+                size_t value_end = value_start;
+                while (value_end < line.size() &&
+                       line[value_end] != ' ' && line[value_end] != '\t' &&
+                       line[value_end] != ',' && line[value_end] != '\n' &&
+                       (!quoted || line[value_end] != '"')) {
+                    value_end++;
+                }
+                std::string filename = line.substr(value_start, value_end - value_start);
+                // Don't rewrite absolute paths or paths already containing directory separators
+                if (!filename.empty() && filename[0] != '/' && filename.find('/') == std::string::npos) {
+                    std::string new_path = plumed_dir + "/" + filename;
+                    if (quoted) {
+                        line.replace(value_start - 1, value_end - value_start + 2, "\"" + new_path + "\"");
+                    } else {
+                        line.replace(value_start, value_end - value_start, new_path);
+                    }
+                    // One FILE= rewrite per line is sufficient for typical plumed.dat syntax
+                    break;
+                }
+                pos = value_end;
+            }
+            result += line;
+            result += '\n';
+        }
+        return result;
+    };
     if (m_mtd) {
         m_plumedmain = plumed_create();
         int real_precision = 8;
@@ -1697,10 +1766,34 @@ void SimpleMD::prepareRun()
         plumed_cmd(m_plumedmain, "setMDChargeUnits", &chargeUnit);
         plumed_cmd(m_plumedmain, "setTimestep", &m_dT); // Pass a pointer to the molecular dynamics timestep to plumed                       // Pass the name of your md engine to plumed (now it is just a label)
         plumed_cmd(m_plumedmain, "setKbT", &kb_Eh);
-        plumed_cmd(m_plumedmain, "setLogFile", "plumed_log.out"); // Pass the file  on which to write out the plumed log (to be created)
+        // Claude Generated 2026: Route PLUMED log into BMT/plumed-files subdirectory
+        std::string plumed_log_path = plumedPath("plumed_log.out");
+        plumed_cmd(m_plumedmain, "setLogFile", plumed_log_path.c_str()); // Pass the file on which to write out the plumed log
         plumed_cmd(m_plumedmain, "setRestart", &restart); // Pointer to an integer saying if we are restarting (zero means no, one means yes)
         plumed_cmd(m_plumedmain, "init", NULL);
-        plumed_cmd(m_plumedmain, "read", m_plumed.c_str());
+        // Claude Generated 2026: When BMT is active, rewrite FILE= paths in plumed.dat
+        // so PLUMED output (COLVAR, HILLS, etc.) lands in BMT/plumed-files/ instead of CWD.
+        // readInputLines must be called AFTER init (per PLUMED API requirement).
+        if (!m_plumed_dir.empty()) {
+            // Read plumed.dat content, rewrite FILE= paths, pass modified content to PLUMED
+            std::ifstream plumed_file(m_plumed);
+            if (!plumed_file.is_open()) {
+                CurcumaLogger::error_fmt("Cannot open PLUMED input file: {}", m_plumed);
+            }
+            std::string content((std::istreambuf_iterator<char>(plumed_file)),
+                                std::istreambuf_iterator<char>());
+            std::string modified = rewritePlumedDatPaths(content, m_plumed_dir);
+            plumed_cmd(m_plumedmain, "readInputLines", modified.c_str());
+            // Save modified plumed.dat to BMT directory for provenance
+            std::string provenance_path = outputPath(Basename() + ".plumed.dat");
+            std::ofstream prov_file(provenance_path);
+            if (prov_file.is_open()) {
+                prov_file << modified;
+            }
+        } else {
+            // No BMT or redirect disabled: read plumed.dat as-is from disk
+            plumed_cmd(m_plumedmain, "read", m_plumed.c_str());
+        }
         plumed_cmd(m_plumedmain, "setStep", &m_step);
         plumed_cmd(m_plumedmain, "setPositions", &m_eigen_geometry.data()[0]);
         plumed_cmd(m_plumedmain, "setEnergy", &m_Epot);
@@ -1751,6 +1844,30 @@ void SimpleMD::prepareRun()
             std::cout << "Well Tempered\tOn (" << m_rmsd_DT << ")" << std::endl;
         else
             std::cout << "Well Tempered\tOff" << std::endl;
+    }
+
+    // Claude Generated 2026: CSV status output — header mirrors the console table.
+    // Written to <basename>.md.csv in the BMT output directory (or CWD with -no_bmt).
+    if (m_write_csv) {
+        m_csv_file.open(outputPath(Basename() + ".md.csv"));
+        if (!m_csv_file.is_open()) {
+            CurcumaLogger::warn("Could not open CSV status file, continuing without it.");
+        } else {
+            m_csv_file << "\xEF\xBB\xBF";  // UTF-8 BOM
+            m_csv_file << "step" << m_csv_delimiter << "time_ps" << m_csv_delimiter
+                       << "epot" << m_csv_delimiter << "epot_avg" << m_csv_delimiter
+                       << "ekin" << m_csv_delimiter << "ekin_avg" << m_csv_delimiter
+                       << "etot" << m_csv_delimiter << "etot_avg" << m_csv_delimiter
+                       << "temperature" << m_csv_delimiter << "temperature_avg" << m_csv_delimiter
+                       << "wall_potential" << m_csv_delimiter << "wall_potential_avg" << m_csv_delimiter
+                       << "virial_correction" << m_csv_delimiter << "virial_correction_avg" << m_csv_delimiter
+                       << "remaining" << m_csv_delimiter << "dt";
+            if (m_dipole)
+                m_csv_file << m_csv_delimiter << "dipole_debye";
+            if (m_writeUnique)
+                m_csv_file << m_csv_delimiter << "n_unique";
+            m_csv_file << "\n";
+        }
     }
     PrintStatus();
     m_run_prepared = true;
@@ -2011,6 +2128,11 @@ void SimpleMD::finalizeRun()
     restart_file << restart << std::endl;
     if (m_run_aborted == false)
         std::remove(snapshotPath("curcuma_restart.json").c_str());
+
+    // Claude Generated 2026: close CSV status file (also closed by the ofstream
+    // destructor if finalizeRun() is skipped on an early abort).
+    if (m_csv_file.is_open())
+        m_csv_file.close();
 
     m_run_prepared = false;
 }
@@ -3047,6 +3169,27 @@ void SimpleMD::PrintStatus() const
         if (m_writeUnique)
             line += fmt::format(" {: ^15}", m_unqiue->StoredStructures());
         std::cout << line << "\n";
+    }
+
+    // Claude Generated 2026: CSV status row — mirrors the console line above.
+    // Same values, delimiter-separated, fixed 6 decimals. m_step stays an integer
+    // (written before std::fixed is applied to the stream).
+    if (m_write_csv && m_csv_file.is_open()) {
+        m_csv_file << m_step << m_csv_delimiter
+                   << std::fixed << std::setprecision(6)
+                   << m_currentStep / 1000.0 << m_csv_delimiter
+                   << m_Epot << m_csv_delimiter << m_aver_Epot << m_csv_delimiter
+                   << m_Ekin << m_csv_delimiter << m_aver_Ekin << m_csv_delimiter
+                   << m_Etot << m_csv_delimiter << m_aver_Etot << m_csv_delimiter
+                   << m_T << m_csv_delimiter << m_aver_Temp << m_csv_delimiter
+                   << m_wall_potential << m_csv_delimiter << m_average_wall_potential << m_csv_delimiter
+                   << m_virial_correction << m_csv_delimiter << m_average_virial_correction << m_csv_delimiter
+                   << remaining << m_csv_delimiter << m_time_step / 1000.0;
+        if (m_dipole)
+            m_csv_file << m_csv_delimiter << m_aver_dipol_linear * 2.5418 * 3.3356;
+        if (m_writeUnique)
+            m_csv_file << m_csv_delimiter << m_unqiue->StoredStructures();
+        m_csv_file << "\n";
     }
 
     // RATTLE constraint summary (only when RATTLE is active)

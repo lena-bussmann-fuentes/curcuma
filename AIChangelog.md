@@ -4,6 +4,10 @@ This file tracks significant improvements, refactorings, and new features genera
 
 Format: One line per change, newest first.
 
+## September 2026
+
+- **SimpleMD CSV status output**: Per-step energies/temperatures (same data as the console `PrintStatus()` table) are written to `<basename>.md.csv` in the BMT output directory. UTF-8 with BOM, configurable delimiter (`csv_delimiter`, default `;` for German-locale spreadsheet compatibility), frequency follows `print_frequency`. New PARAMs `write_csv` (default true) and `csv_delimiter`. CLI test `cli_simplemd_13_csv_output`. See [docs/MD_CSV_OUTPUT.md](docs/MD_CSV_OUTPUT.md). 🤖 AI-generated.
+
 ## June 2026
 
 - **BMT output directory system**: All commands default to creating a `Basename.Keyword.YYYYMMDD_HHMMSS/` directory for output. `-bak` flag copies specified files back to CWD. `-no_bmt` disables BMT (legacy CWD output). `BMTUtils` namespace provides `createBMTDir`, `writeMetadata`, `processBakFiles`, `outputPath`, `stripExtension`, `collectBakFiles`. `CurcumaMethod` integration via `createBMTDir()`, `addBakFile()`, `processBakFiles()`. 🤖 AI-generated.
