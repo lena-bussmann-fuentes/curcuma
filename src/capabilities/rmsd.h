@@ -126,6 +126,13 @@ public:
         m_target_original = target;
     }
 
+    /*! \brief Claude Generated (Jun 2026): per-atom weights for flexibility-weighted
+     *  best-fit RMSD (used by RMSD-MTD / ConfSearch calibration). Empty = uniform =
+     *  the previous unweighted behaviour (bit-identical). Size must match the atom count
+     *  used in BestFitRMSD()/Gradient(); otherwise the weights are ignored. */
+    inline void setRMSDWeights(const std::vector<double>& weights) { m_rmsd_weights = weights; }
+    inline void clearRMSDWeights() { m_rmsd_weights.clear(); }
+
     void setMatchingAtoms(const std::vector<int>& reference_atoms, const std::vector<int>& target_atoms);
 
     double Rules2RMSD(const std::vector<int> rules, int fragment = -1);
@@ -146,19 +153,37 @@ public:
     /*! \brief Return the reference molecule centered */
     inline const Molecule* ReferenceAlignedReference() const { return &m_reference_aligned; }
 
-    /*! \brief Return the target molecule centered and aligned to the reference molecule */
+    /*! \brief Target in the ORIGINAL atom order, centered. Best-fit rotated to the reference
+     *  only when no reordering ran; on the reorder path it is left centered/un-reordered (the
+     *  reordered + aligned geometry is TargetReorderd()). So when reordering was requested,
+     *  this does NOT correspond to RMSD() — use TargetReorderd() for that. Claude doc-fix. */
     inline Molecule TargetAligned() const { return m_target_aligned; }
 
-    /*! \brief Return the target molecule centered and aligned to the reference molecule */
+    /*! \brief Pointer twin of TargetAligned() — same caveat (un-reordered on the reorder path). */
     inline const Molecule* TargetAlignedReference() const { return &m_target_aligned; }
 
-    /*! \brief Return the target molecule reorderd but remaining at the original position */
+    /*! \brief Target reordered to the reference atom mapping AND Kabsch-aligned to the
+     *  reference frame (this is the geometry whose deviation is RMSD()). Empty when no
+     *  reordering ran. Claude doc-fix (was wrongly "remaining at the original position"). */
     inline Molecule TargetReorderd() const { return m_target_reordered; }
 
-    /*! \brief Return best-fit reordered RMSD */
+    /*! \brief The target geometry whose deviation from ReferenceAligned() equals RMSD():
+     *  the reordered + aligned target when reordering ran, otherwise the plain best-fit
+     *  target. Prefer this for overlay/visualisation/output instead of hand-rolling the
+     *  TargetReorderd()/TargetAligned() fallback (the source of a GUI overlay bug; see
+     *  docs/TECHNICAL_DEBT.md R-1). Claude Generated. */
+    inline Molecule TargetForRMSD() const
+    {
+        return m_target_reordered.AtomCount() > 0 ? m_target_reordered : m_target_aligned;
+    }
+
+    /*! \brief Best-fit RMSD after reordering (the permutation RMSD); equals the plain value
+     *  when no reordering ran. */
     inline double RMSD() const { return m_rmsd; }
 
-    /*! \brief Return best-fit RMSD with reordering */
+    /*! \brief Plain best-fit RMSD in the original atom order, WITHOUT reordering. Only
+     *  populated on the reorder path (matching atom multisets); 0 otherwise. Claude doc-fix
+     *  (was wrongly "with reordering"). */
     inline double RMSDRaw() const { return m_rmsd_raw; }
 
     /*! \brief Force Reordering, even the sequence of elements are equal */
@@ -225,6 +250,13 @@ public:
     double SimpleRMSD();
 
     double BestFitRMSD();
+
+    /** Claude Generated (Jul 2026): best-fit RMSD assuming reference AND target geometries are
+     *  ALREADY geometric-centered (same convention as CenterMolecule). Skips the two re-centering
+     *  passes of BestFitRMSD -- used by the RMSD-MTD screen fast path, where the walker is centered
+     *  once per step and hills are pre-centered/cached. Leaves the (centered) reference untouched and
+     *  stores the rotated target so Gradient() stays valid. Ignores per-atom weights. */
+    double BestFitRMSDCentered();
 
     double CustomRotation();
 
@@ -347,6 +379,7 @@ private:
     std::vector<int> m_reorder_rules;
     std::vector<std::vector<int>> m_stored_rules, m_intermedia_rules;
     std::vector<double> m_tmp_rmsd;
+    std::vector<double> m_rmsd_weights;  // Claude Generated (Jun 2026): optional per-atom weights for BestFitRMSD/Gradient (empty = uniform)
     double m_rmsd = 0, m_rmsd_raw = 0, m_scaling = 1.5, m_intermedia_storage = 1, m_threshold = 99, m_damping = 0.8, m_km_convergence = 1e-3;
     bool m_check = false;
     bool m_check_connections = false, m_postprocess = true, m_noreorder = false, m_swap = false, m_dynamic_center = false;
@@ -378,12 +411,19 @@ private:
 
     // --- General & Threading ---
     PARAM(threads, Int, 1, "Number of threads for parallel execution.", "Performance", {})
-    PARAM(protons, Bool, true, "Include protons in the calculation (opposite of 'heavy').", "General", {"heavy"})
+    /* Claude Generated (Aug 2026): 'heavy' used to be a plain alias of 'protons', which
+       inverted its meaning - a bare CLI flag becomes true, so '-heavy' asked for
+       protons=true, i.e. the exact opposite of heavy-only, and only '-heavy false'
+       (or -rmsd.protons false) did what the help text promised. It is now its own
+       parameter with the documented polarity; the two are combined as
+       m_protons = protons && !heavy (see rmsd.cpp), so the defaults are unchanged. */
+    PARAM(protons, Bool, true, "Include protons in the calculation (opposite of 'heavy').", "General", {})
+    PARAM(heavy, Bool, false, "Use only heavy atoms, i.e. exclude protons (opposite of 'protons').", "General", {})
     PARAM(force_reorder, Bool, false, "Force reordering even if atom counts match.", "General", {"reorder"})
     PARAM(no_reorder, Bool, false, "Disable all reordering logic.", "General", {"noreorder"})
 
     // --- Alignment Method ---
-    PARAM(method, String, "incr", "Alignment method: hungarian|incr|template|hybrid|subspace|inertia|molalign|dtemplate|predefined.", "Method", {"RMSDmethod", "rmsdmethod"})
+    PARAM(method, String, "subspace", "Alignment method: subspace (default, recommended)|inertia (recommended)|template|dtemplate|incr (legacy)|molalign (external)|hungarian|predefined.", "Method", {"RMSDmethod", "rmsdmethod"})
     PARAM(limit, Int, 0, "Limit for subspace and dtemplate methods.", "Method", {})
     PARAM(element, String, "7", "Element(s) for template methods (e.g., \"7,8\").", "Method", {"Element"})
     PARAM(order_file, String, "", "Path to a file with a predefined atom order.", "Method", {"order"})

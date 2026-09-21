@@ -78,6 +78,15 @@ Molecule::Molecule(const Molecule& other)
     m_mass = other.m_mass; // Claude Generated 2025: Copy molecular mass (fixes VTF trajectory m_mass=0 bug)
     m_unit_cell = other.m_unit_cell; // Claude Generated 2025: Copy PBC data
     m_has_pbc = other.m_has_pbc;
+    // Claude Generated 2026: Copy persistent topology (fixes polymer topology loss on copy)
+    m_persistent_topology = other.m_persistent_topology;
+    m_has_persistent_topology = other.m_has_persistent_topology;
+    m_topology_matrix = other.m_topology_matrix;
+    m_distance_matrix = other.m_distance_matrix;
+    m_distance_cache_valid = other.m_distance_cache_valid;
+    m_scaling = other.m_scaling;
+    m_hbond_cutoff = other.m_hbond_cutoff;
+    m_dirty = other.m_dirty;
 }
 /*
 Molecule& Molecule::operator=(const Molecule& other)
@@ -107,6 +116,15 @@ Molecule::Molecule(const Molecule* other)
     m_borders = other->m_borders;
     m_unit_cell = other->m_unit_cell; // Claude Generated 2025: Copy PBC data
     m_has_pbc = other->m_has_pbc;
+    // Claude Generated 2026: Copy persistent topology (fixes polymer topology loss on copy)
+    m_persistent_topology = other->m_persistent_topology;
+    m_has_persistent_topology = other->m_has_persistent_topology;
+    m_topology_matrix = other->m_topology_matrix;
+    m_distance_matrix = other->m_distance_matrix;
+    m_distance_cache_valid = other->m_distance_cache_valid;
+    m_scaling = other->m_scaling;
+    m_hbond_cutoff = other->m_hbond_cutoff;
+    m_dirty = other->m_dirty;
 }
 /*
 Molecule& Molecule::operator=(const Molecule* other)
@@ -204,6 +222,8 @@ Mol Molecule::getMolInfo() const
     mol.m_bonds = m_bonds;
     mol.m_atoms = m_atoms;
     mol.m_partial_charges = m_charges;
+    mol.m_topology = m_persistent_topology;
+    mol.m_has_topology = m_has_persistent_topology;
     mol.m_unit_cell = m_unit_cell; // Claude Generated 2025: Export PBC data
     mol.m_has_pbc = m_has_pbc;
     return mol;
@@ -269,13 +289,43 @@ void Molecule::Initialise(const int* attyp, const double* coord, const int natom
     }
 }
 
-void Molecule::ApplyReorderRule(const std::vector<int>& rule)
+/* Claude Generated (Aug 2026): the loop used to be bounded by rule.size() with no
+   precondition check, so a rule that did not cover the whole molecule silently rewrote it
+   with rule.size() atoms - ConfScan's heavy-atom mode (rule sized to the heavy subset,
+   indices pointing into the compacted heavy list) produced truncated AND scrambled
+   structures, and its plain-RMSD rejection path (empty rule) produced 0-atom structures.
+   The rule is now validated as a complete permutation; anything else is a no-op. */
+bool Molecule::ApplyReorderRule(const std::vector<int>& rule)
 {
+    const std::size_t n = AtomCount();
+    if (rule.size() != n || n == 0)
+        return false;
+
+    std::vector<bool> seen(n, false);
+    for (int i : rule) {
+        if (i < 0 || static_cast<std::size_t>(i) >= n || seen[i])
+            return false;
+        seen[i] = true;
+    }
+
     Molecule mol;
     for (auto& i : rule)
         mol.addPair(Atom(i));
     m_geometry = mol.m_geometry;
     m_atoms = mol.m_atoms;
+    invalidateCaches();
+    return true;
+}
+
+Molecule Molecule::ProtonDepletedCopy() const
+{
+    Molecule depleted;
+    for (std::size_t i = 0; i < AtomCount(); ++i) {
+        std::pair<int, Position> atom = Atom(i);
+        if (atom.first != 1)
+            depleted.addPair(atom);
+    }
+    return depleted;
 }
 
 // Claude Generated: Temporary fallback to std::cout to fix SegFault
@@ -663,6 +713,8 @@ void Molecule::LoadMolecule(const Mol& molecule)
     InitialiseEmptyGeometry(AtomCount());
     m_geometry = (molecule.m_geometry);
     m_bonds = molecule.m_bonds;
+    m_persistent_topology = molecule.m_topology;
+    m_has_persistent_topology = molecule.m_has_topology;
     m_unit_cell = molecule.m_unit_cell; // Claude Generated 2025: Copy PBC data
     m_has_pbc = molecule.m_has_pbc;
 }
@@ -678,6 +730,8 @@ void Molecule::LoadMolecule(const Mol* molecule)
     InitialiseEmptyGeometry(AtomCount());
     m_geometry = (molecule->m_geometry);
     m_bonds = molecule->m_bonds;
+    m_persistent_topology = molecule->m_topology;
+    m_has_persistent_topology = molecule->m_has_topology;
     m_unit_cell = molecule->m_unit_cell; // Claude Generated 2025: Copy PBC data
     m_has_pbc = molecule->m_has_pbc;
 }
@@ -1510,6 +1564,15 @@ void Molecule::appendXYZFile(const std::string& filename) const
     input.close();
 }
 
+/// Claude Generated: append XYZ frame with custom comment line (for multi-frame trajectory files)
+void Molecule::appendXYZFile(const std::string& filename, const std::string& comment) const
+{
+    std::ofstream out(filename, std::ios_base::app);
+    out << fmt::format("{}\n{}\n", AtomCount(), comment);
+    for (int i = 0; i < AtomCount(); ++i)
+        out << Atom2String(i);
+}
+
 void Molecule::appendDipoleFile(const std::string& filename) const
 {
     std::string output;
@@ -1918,12 +1981,61 @@ Molecule Molecule::ElementsRemoved(const std::vector<int>& elements)
 
 Molecule Molecule::AtomsRemoved(const std::vector<int>& atoms)
 {
-    Molecule mol;
+    // Guard against internal inconsistency that leads to SIGSEGV in Atom(i)
+    if (m_geometry.rows() != AtomCount()) {
+        std::cerr << "ERROR: Molecule::AtomsRemoved called with inconsistent state: "
+                  << "geometry.rows()=" << m_geometry.rows()
+                  << " != AtomCount()=" << AtomCount() << "\n";
+        return Molecule();
+    }
+
+    // Build kept atom list
+    std::vector<std::pair<int, Position>> kept_atoms;
     for (int i = 0; i < AtomCount(); ++i) {
         auto pair = Atom(i);
-        if (std::find(atoms.begin(), atoms.end(), i) == atoms.end())
-            mol.addPair(pair);
+        if (std::find(atoms.begin(), atoms.end(), i) == atoms.end()) {
+            kept_atoms.push_back(pair);
+        }
     }
+
+    Molecule mol;
+    mol.setCharge(Charge());
+    mol.setSpin(Spin());
+    mol.setName(Name()); // Claude Generated: Preserve molecule name
+    for (const auto& pair : kept_atoms) {
+        mol.addPair(pair);
+    }
+
+    // Claude Generated: Preserve topology if available
+    // Handle case where topology dimensions < AtomCount (atoms added after topology set)
+    if (m_has_persistent_topology && m_persistent_topology.rows() > 0) {
+        int new_n = mol.AtomCount();
+        Matrix new_topo = Matrix::Zero(new_n, new_n);
+
+        // Build index mapping: old -> new
+        // Only map atoms that were in the original topology
+        std::map<int, int> index_map;
+        int new_idx = 0;
+        for (int old_idx = 0; old_idx < AtomCount(); ++old_idx) {
+            if (std::find(atoms.begin(), atoms.end(), old_idx) == atoms.end()) {
+                index_map[old_idx] = new_idx++;
+            }
+        }
+
+        // Copy topology with adjusted indices
+        // Only copy bonds for atoms that existed in the persistent topology
+        for (const auto& [old_i, new_i] : index_map) {
+            for (const auto& [old_j, new_j] : index_map) {
+                // Only copy if both atoms were in the original topology
+                if (old_i < m_persistent_topology.rows() && old_j < m_persistent_topology.cols()) {
+                    new_topo(new_i, new_j) = m_persistent_topology(old_i, old_j);
+                }
+            }
+        }
+
+        mol.setTopologyMatrix(new_topo);
+    }
+
     return mol;
 }
 
@@ -1938,7 +2050,13 @@ std::pair<Matrix, Matrix> Molecule::DistanceMatrix() const
 
     const int natoms = AtomCount();
     m_distance_matrix = Eigen::MatrixXd::Zero(natoms, natoms);
-    m_topology_matrix = Eigen::MatrixXd::Zero(natoms, natoms);
+
+    // If we have a persistent topology, use it instead of computing it
+    if (m_has_persistent_topology) {
+        m_topology_matrix = m_persistent_topology;
+    } else {
+        m_topology_matrix = Eigen::MatrixXd::Zero(natoms, natoms);
+    }
 
     // Calculate only upper triangle, then mirror (symmetric matrices)
     for (int i = 0; i < natoms; ++i) {
@@ -1950,17 +2068,33 @@ std::pair<Matrix, Matrix> Molecule::DistanceMatrix() const
             m_distance_matrix(i, j) = distance;
             m_distance_matrix(j, i) = distance;
 
-            // Topology based on covalent radii + scaling factor
-            double bond_cutoff = (Elements::CovalentRadius[Atom(i).first] + Elements::CovalentRadius[Atom(j).first]) * m_scaling;
-            bool is_bonded = (distance <= bond_cutoff);
+            if (!m_has_persistent_topology) {
+                // Topology based on covalent radii + scaling factor
+                double bond_cutoff = (Elements::CovalentRadius[Atom(i).first] + Elements::CovalentRadius[Atom(j).first]) * m_scaling;
+                bool is_bonded = (distance <= bond_cutoff);
 
-            m_topology_matrix(i, j) = is_bonded;
-            m_topology_matrix(j, i) = is_bonded;
+                m_topology_matrix(i, j) = is_bonded;
+                m_topology_matrix(j, i) = is_bonded;
+            }
         }
     }
 
     m_distance_cache_valid = true;
     return std::make_pair(m_distance_matrix, m_topology_matrix);
+}
+
+void Molecule::setTopologyMatrix(const Matrix& topology)
+{
+    m_persistent_topology = topology;
+    m_has_persistent_topology = true;
+    m_topology_matrix = topology;
+    invalidateCaches();
+    // Claude Generated 2026: Sync bond list from topology matrix
+    m_bonds.clear();
+    for (int i = 0; i < topology.rows(); ++i)
+        for (int j = i + 1; j < topology.cols(); ++j)
+            if (topology(i, j) > 0.5)
+                m_bonds.push_back({i, j});
 }
 
 std::pair<Matrix, Matrix> Molecule::DistanceMatrix(const std::vector<int>& indices) const
@@ -1982,6 +2116,15 @@ std::pair<Matrix, Matrix> Molecule::DistanceMatrix(const std::vector<int>& indic
     Matrix distance_matrix = Eigen::MatrixXd::Zero(nselected, nselected);
     Matrix topology_matrix = Eigen::MatrixXd::Zero(nselected, nselected);
 
+    // If we have a persistent topology, extract the submatrix
+    if (m_has_persistent_topology) {
+        for (int i = 0; i < nselected; ++i) {
+            for (int j = 0; j < nselected; ++j) {
+                topology_matrix(i, j) = m_persistent_topology(valid_indices[i], valid_indices[j]);
+            }
+        }
+    }
+
     // Calculate only upper triangle, then mirror (symmetric matrices)
     for (int i = 0; i < nselected; ++i) {
         for (int j = i + 1; j < nselected; ++j) {
@@ -1995,12 +2138,14 @@ std::pair<Matrix, Matrix> Molecule::DistanceMatrix(const std::vector<int>& indic
             distance_matrix(i, j) = distance;
             distance_matrix(j, i) = distance;
 
-            // Topology based on covalent radii + scaling factor
-            double bond_cutoff = (Elements::CovalentRadius[Atom(atom_i).first] + Elements::CovalentRadius[Atom(atom_j).first]) * m_scaling;
-            bool is_bonded = (distance <= bond_cutoff);
+            if (!m_has_persistent_topology) {
+                // Topology based on covalent radii + scaling factor
+                double bond_cutoff = (Elements::CovalentRadius[Atom(atom_i).first] + Elements::CovalentRadius[Atom(atom_j).first]) * m_scaling;
+                bool is_bonded = (distance <= bond_cutoff);
 
-            topology_matrix(i, j) = is_bonded;
-            topology_matrix(j, i) = is_bonded;
+                topology_matrix(i, j) = is_bonded;
+                topology_matrix(j, i) = is_bonded;
+            }
         }
     }
 

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -47,4 +48,5 @@ private:
     static std::set<std::string> m_seen;                                  // fast lookup
     static std::vector<std::pair<std::string, std::string>> m_subrefs;   // (child, parent)
     static std::string m_output_dir;                                      // BMT directory for BibTeX output
+    static std::mutex m_mutex;                                             // thread safety
 };

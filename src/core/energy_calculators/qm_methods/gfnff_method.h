@@ -46,10 +46,18 @@ public:
     Vector getCharges() const override;
     Vector getBondOrders() const override;
     Position getDipole() const override;
+    /// Claude Generated 2026 — return GFN-FF CN from last calculateEnergy() call
+    Vector getCN() const override;
     bool updateGeometry(const Matrix& geometry) override;
     bool hasGradient() const override { return true; }
     bool isThreadSafe() const override { return false; }
     std::string getMethodName() const override { return m_method_name; }
+
+    /// Test hook: #EEQ PCG solves that used the multi-step warm-start extrapolation.
+    /// Claude Generated.
+    long eeqPcgExtrapolationCount() const {
+        return m_gfnff ? m_gfnff->eeqPcgExtrapolationCount() : -1;
+    }
 
     // Configuration
     void setThreadCount(int threads) override;
@@ -65,7 +73,6 @@ public:
     json getEnergyDecomposition() const override;
 
     // WP-S2 (May 2026): per-step diagnostics hooks
-    Vector getCN() const override;
     int getHBCount() const override;
     int getXBCount() const override;
 

@@ -93,10 +93,48 @@ test_cases/**/curcuma_*.json
 test_cases/**/*.log
 test_cases/**/*.dat
 !test_cases/**/baseline.dat
+!test_cases/MOR41-testset/reactions.dat
+
+# MOR41 validation: track the driver data, ignore generated run artifacts
+test_cases/MOR41-testset/_run/
+
+# GFN-FF / MD topology dumps (generated during runs) - Claude Generated May 2026
+*.topo.json
+
+# Metadynamics trajectory output (generated) - Claude Generated May 2026
+*.mtd.xyz
+
+# ConfScan ensemble outputs under molecules/ (generated during runs).
+# NOTE: cli/confscan/*/conformers.*.xyz are tracked regression baselines - do NOT
+# add a broad test_cases/** pattern here. Claude Generated May 2026
+test_cases/molecules/**/*.initial.xyz
+test_cases/molecules/**/*.accepted.xyz
+test_cases/molecules/**/*.rejected.xyz
+test_cases/molecules/**/*.reorder.*.xyz
+test_cases/molecules/**/*.reuse.xyz
+test_cases/molecules/**/*.thresh.xyz
+
+# ConfSearch run artifacts (MD/opt trajectories, restart checkpoints) - Claude Generated Jul 2026
+test_cases/**/.snapshots/
+test_cases/**/*_step_*.json
+test_cases/**/*.final.json
+test_cases/**/*.bias.xyz
+test_cases/**/*.bias.opt.accepted.xyz
+test_cases/**/*.cumulative.xyz
+test_cases/**/*.cumulative.opt.accepted.xyz
+test_cases/**/*.input.xyz
+test_cases/**/*_md_params.json
+test_cases/**/*.confsearch.restart.json
 
 # Root-level output files (optimization and trajectory outputs)
 *.opt.xyz
 *.trj.xyz
+
+# Test fixture (committed): scf_extrapolation_caffeine interpolation endpoint
+!test_cases/sqm_reference/molecules/caffeine.opt.xyz
+
+# ConfSearch exported MD parameter dump (run artifact) - Claude Generated May 2026
+confsearch_md_params.json
 
 # Debug executables and analysis scripts - Claude Generated December 2025
 debug_*
@@ -107,12 +145,11 @@ Testing/
 FINAL_COMMIT_MESSAGE.md
 COMMIT_MESSAGE_*.md
 
-
-# Downloaded external dependencies (should be fetched via submodules/CMake)
-external/eigen-3.4.0.zip
+# External dependencies (CMake downloads) - Claude Generated November 2025
 external/eigen-3.4.0/
-external/ulysses.zip
+external/eigen-3.4.0.zip
 external/ulysses-main/
+external/ulysses.zip
 external/json.hpp
 external/stb_image_write.h
 

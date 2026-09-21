@@ -131,6 +131,28 @@
 - **Verweis**: src/capabilities/CLAUDE.md:80
 - **Phases**: Phase 1-2 ✅, Phase 3 ⏳
 
+### ConfSearch: CxxThreadPool Crash mit threads=1 + Progress-Bar
+- **Status**: ⏳ PENDING
+- **Problem**: CxxThreadPool im Legacy-Modus crashed bei threads=1 (SIGSEGV nach Optimization). Discrete-Progress-Bar funktioniert nur im Legacy-Modus (ParallelLoop ruft updateStatus()), nicht im Worker-Pool-Modus.
+- **Task**: 
+  1. Crash in CxxThreadPool Legacy-Modus bei threads=1 debuggen und fixen
+  2. Alternative: Progress-Bar im Worker-Pool-Modus aktivieren (updateStatus() während wait() poll)
+  3. Danach: Serial-Path in PerformOptimisation() entfernen, unified CxxThreadPool für alle threads
+- **Betroffene Dateien**: src/capabilities/confsearch.cpp, external/CxxThreadPool/include/CxxThreadPool.hpp
+- **Verweis**: confsearch-branch, May 2026
+- **Workaround**: Aktuell Serial-Path für threads <= 1, Parallel-Path (Legacy-Modus) für threads > 1
+
+### ConfSearch: GPU + Multi-Threading (Future)
+- **Status**: ⏳ PLANNED
+- **Problem**: Bei threads > 1 konkurrieren mehrere MD-Instanzen um die GPU. Aktuell wird GPU deaktiviert wenn threads > 1.
+- **Task**: 
+  1. Implementiere GPU-Lock (Mutex) oder Queue, sodass nur 1 Thread gleichzeitig die GPU nutzt
+  2. Alternative: Ein Thread bekommt GPU-CUDA, andere nutzen CPU-Fallback
+  3. Dann kann GPU auch bei threads > 1 aktiviert werden
+- **Betroffene Dateien**: src/capabilities/confsearch.cpp, src/core/energycalculator.cpp
+- **Verweis**: confsearch-branch, May 2026
+- **Workaround**: Aktuell wird GPU auf "none" gesetzt wenn threads > 1
+
 ### Enhanced Conformational Search Algorithms
 - **Status**: ⏳ PLANNED
 - **Betroffene Dateien**: src/capabilities/confsearch.cpp/h
@@ -205,6 +227,154 @@
 - **Overall**: 26/26 ✅ (100%) 🎯
 
 ---
+
+**Last Updated**: 2025-11-14
+**Next Review**: When starting CG implementation (Phase 1: Molecule helpers) or cgfnff debugging
+
+## Native QM Methods (GFN2, GFN1, PM3) - November 2025
+
+### ✅ Completed (Phase 1-4)
+
+- [x] GFN2-xTB native implementation structure
+- [x] GFN2 core algorithms (CN, Hamiltonian, SCF, energies)
+- [x] GFN2 analytical gradients (Electronic, Repulsion, Coulomb, CN) - ✅ **NEW Feb 2026**
+- [x] GFN1-xTB native implementation with halogen bond correction
+- [x] PM3 NDDO implementation (H, C, N, O)
+- [x] Integration into MethodFactory with priority fallbacks
+- [x] Educational documentation (NATIVE_QM_IMPLEMENTATION_STATUS.md)
+- [x] **Parameter loader infrastructure** (`gfn2_params_loader.h/cpp`) with real TBLite parameters for all 86 elements - ✅ **NEW Feb 2026**
+- [x] **Ulysses methods documentation** - Complete guide for 27 semi-empirical methods (AM1, MNDO, PM6, etc.)
+- [x] **Overlap Derivatives** analytical implementation in `STOIntegrals.hpp` - ✅ **NEW Feb 2026**
+
+### 🔧 TODO: Parameter Expansion (Medium Priority)
+
+**Files**: `gfn2_params_loader.cpp`, `gfn2_params_loader.h`
+**Status**: ✅ Infrastructure and 86-element DB complete, ⏳ Extension needed
+
+**GFN2 Real Parameters from TBLite** (Foundation ✅, Extension needed):
+- [x] ✅ Parameter loader class structure (`ParameterDatabase`)
+- [x] ✅ Shell-resolved parameter structures (`ShellParams`, `ElementParams`, `PairParams`)
+- [x] ✅ Hardcoded real parameters for all 86 elements (basic set) - ✅ **UPDATED Feb 2026**
+- [x] ✅ Element-pair specific Hamiltonian scaling (C-H, C-C, C-N, C-O, N-H, O-H)
+- [x] ✅ Exact shell-Hubbard corrections from TBLite (SHELL_HUBBARD_CORR) - ✅ **NEW March 2026**
+- [x] ✅ D4 dispersion integration (USE_D4 conditional) - ✅ **NEW March 2026**
+- [ ] ⏳ Full TOML parser implementation (currently: stub)
+- [x] ✅ Complete periodic table coverage (86 elements) - ✅ **UPDATED Feb 2026**
+- [ ] ⏳ Extract polynomial corrections poly(r) for all pairs
+- [ ] ⏳ Extract complete gamma-AB Coulomb kernel parameters
+- [ ] ⏳ Extract full AES2 multipole parameters (quadrupoles)
+- [ ] ⏳ Validate against TBLite reference energies (<1% error target)
+
+**GFN1 Real Parameters from TBLite**:
+- [ ] Create `gfn1_params_loader.h/cpp` (analogous structure)
+- [ ] Extract simplified parameter set (no ES3)
+- [ ] Extract halogen bond parameters for F, Cl, Br, I, At
+- [ ] Validate against TBLite GFN1 reference
+
+**Implementation Notes**:
+- ✅ Foundation in place: See `gfn2_params_loader.cpp:41-318`
+- ✅ Educational transparency: Comments explain each parameter's physical meaning
+- ⏳ Next step: Implement `parseSimpleTOML()` or use external TOML library (toml11)
+- ⏳ Alternative: Continue hardcoding parameters from TBLite source for remaining elements
+
+### 🎯 TODO: PM3 Element Extension (Medium Priority)
+
+**Critical Missing Elements**:
+- [ ] F (Fluorine) - Important for pharmaceuticals
+- [ ] Cl (Chlorine) - Common in organic chemistry
+- [ ] S (Sulfur) - Biochemistry (cysteine, methionine)
+- [ ] P (Phosphorus) - DNA, ATP, phosphates
+
+**Parameter Source**: MOPAC parameter database
+- URL: http://openmopac.net/manual/parameters.html
+- Format: U_ss, U_pp, beta_s, beta_p, zeta_s, zeta_p, alpha, Gaussian terms
+
+**Extended Elements** (Lower Priority):
+- [ ] Br, I (heavier halogens)
+- [ ] Si, Se (semiconductors, proteins)
+- [ ] Transition metals (Fe, Cu, Zn for catalysis)
+
+### ⚡ TODO: Performance Improvements (Optional)
+
+**Analytical Gradients** (Speedup: 10-20x for optimizations):
+- [x] Implement Hellmann-Feynman theorem derivatives - ✅ **DONE Feb 2026**
+- [x] GFN2: dH/dR, dS/dR analytical formulas (STOIntegrals) - ✅ **DONE Feb 2026**
+- [ ] GFN1: Simplified derivative terms
+- [ ] PM3: NDDO gradient formulas from MOPAC
+- [ ] Benchmark: H2O optimization (numerical vs analytical)
+
+**SCF Acceleration**:
+- [ ] DIIS (Direct Inversion in Iterative Subspace)
+- [ ] Level shifting for difficult convergence
+- [ ] Adaptive damping parameters
+
+### 🧪 TODO: Validation and Testing
+
+**Test Molecules** (Small):
+- [ ] H2O - HOMO/LUMO, dipole moment
+- [ ] CH4 - Symmetry, C-H bonds
+- [ ] NH3 - Lone pair, pyramidal geometry
+- [ ] H2CO - Carbonyl, planarity
+
+**Comparison Targets**:
+- [x] GFN2 native vs TBLite (energy error < 1% with real params) - D4 + Shell-Hubbard completed March 2026
+- [ ] GFN1 native vs TBLite (energy error < 1%)
+- [ ] PM3 native vs MOPAC (energy error < 5%)
+
+**Properties to Validate**:
+- [ ] Total energy (Hartree)
+- [ ] HOMO/LUMO gap (eV)
+- [ ] Mulliken charges
+- [ ] Dipole moment (Debye)
+- [ ] Gradient accuracy (force = -gradient)
+
+### 📋 TODO: Integration Tasks
+
+**D3/D4 Dispersion**:
+- [x] GFN2 D4 integration (March 2026) - calculateDispersionEnergy() implemented
+- [ ] Fix `dftd3interface.h/cpp` issues
+- [ ] Fix `dftd4interface.h/cpp` issues
+- [ ] Connect GFN1 to D3 (replace stub)
+- [ ] Connect GFN2 to D4 (replace stub)
+- [ ] Validate dispersion energies for Ar2, benzene dimer
+
+**Heat of Formation** (PM3-specific):
+- [ ] Implement ΔH_f calculation from atomization energy
+- [ ] Add experimental reference data for validation
+- [ ] Compare with MOPAC heats of formation
+
+### 📚 Documentation TODO
+
+- [ ] Add example usage to CLAUDE.md for each method
+- [ ] Create tutorial: "When to use GFN2 vs GFN1 vs PM3"
+- [ ] Document parameter extraction workflow
+- [ ] Add benchmark comparison tables (TBLite, MOPAC, Ulysses)
+
+### 🚫 NOT TODO (Use Existing Interfaces)
+
+**These methods already available via Ulysses - no native implementation needed**:
+- ❌ AM1 - Available: `method = "am1"` (Ulysses)
+- ❌ MNDO - Available: `method = "mndo"` (Ulysses)
+- ❌ PM6 - Available: `method = "pm6"` (Ulysses)
+- ❌ RM1 - Available: `method = "rm1"` (Ulysses)
+- ❌ PM3PDDG - Available: `method = "pm3pddg"` (Ulysses)
+
+**Reason**: Ulysses interface provides production-quality implementations with full validation. Native implementations only needed for educational purposes or when external dependencies unavailable.
+
+### 📊 Status Summary
+
+**Implementation**: ✅ 100% Complete (3 methods, ~2767 lines)
+**Integration**: ✅ 100% Complete (MethodFactory, CMakeLists.txt)
+**Parameters**: ⚠️ 30% Complete (approximations work, real params TODO)
+**Validation**: ⏸️ 0% Complete (needs test molecules)
+**Performance**: ⚠️ 50% Complete (numerical gradients slow, analytical TODO)
+
+**Next Recommended Action**: Extract GFN2 parameters from TBLite TOML for production accuracy.
+
+---
+
+*Last Updated: November 2025*
+*See: docs/NATIVE_QM_IMPLEMENTATION_STATUS.md for full details*
 
 ---
 

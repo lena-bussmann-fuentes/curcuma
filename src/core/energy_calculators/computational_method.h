@@ -96,6 +96,17 @@ public:
      * @return 3D dipole vector in appropriate units
      */
     virtual Position getDipole() const = 0;
+
+    /**
+     * @brief Get coordination numbers (GFN-FF erf-based) from last calculation.
+     *
+     * Returns the CN vector computed during the last calculateEnergy() call.
+     * Only meaningful after a GFN-FF calculation; other methods return an empty vector.
+     *
+     * Claude Generated 2026 — diagnostic accessor for PolymerBuild CN comparison
+     * @return Vector of per-atom CN values, or empty vector if not supported
+     */
+    virtual Vector getCN() const { return Vector(); }
     
     /**
      * @brief Copy gradient into pre-allocated target (avoids heap allocation).
@@ -234,12 +245,6 @@ public:
     // =================================================================================
 
     /**
-     * @brief Get coordination numbers from last calculation (GFN-FF / FF methods).
-     * Default returns an empty vector. Used by MD diagnostics dump.
-     */
-    virtual Vector getCN() const { return Vector{}; }
-
-    /**
      * @brief Get number of hydrogen bonds detected in last calculation (GFN-FF only).
      */
     virtual int getHBCount() const { return 0; }
@@ -267,6 +272,17 @@ public:
      * Force-on so MD diagnostics get non-zero timing fields without requiring verbosity 2.
      */
     virtual void setForcePhaseTiming(bool /*on*/) {}
+
+    // =================================================================================
+    // SCF warm-start and iterative-mode controls (Claude Generated)
+    // Only meaningful for native GFN1/GFN2 (NativeXtbMethod); all others no-op.
+    // =================================================================================
+
+    /** @brief Enable/disable warm-start: reuse converged charges from previous step. */
+    virtual void setWarmStart(bool /*on*/) {}
+
+    /** @brief Enable/disable iterative mode: raise SCF display threshold by one level. */
+    virtual void setIterativeMode(bool /*on*/) {}
 
     // =================================================================================
     // Force Field Energy Component Access (Claude Generated November 2025)

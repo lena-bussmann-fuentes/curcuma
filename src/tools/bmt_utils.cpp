@@ -31,9 +31,14 @@ std::string createBMTDir(const std::string& basename, const std::string& keyword
 {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::tm* local_tm = std::localtime(&now_time);
+    std::tm local_tm_buf{};
+#ifdef _WIN32
+    localtime_s(&local_tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &local_tm_buf);
+#endif
     char timestamp[32];
-    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", local_tm);
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &local_tm_buf);
 
     std::string bmt_dir = basename + "." + keyword + "." + timestamp;
 
@@ -52,7 +57,7 @@ void writeMetadata(const std::string& bmt_dir,
                    const std::string& method,
                    const std::string& input_file)
 {
-    std::string meta_path = bmt_dir + "/metadata.txt";
+    std::string meta_path = bmt_dir + "/metadata.json";
     std::ofstream meta(meta_path);
     if (!meta.is_open()) {
         CurcumaLogger::warn_fmt("Could not create metadata file: {}", meta_path);
@@ -61,15 +66,21 @@ void writeMetadata(const std::string& bmt_dir,
 
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::tm* local_tm = std::localtime(&now_time);
+    std::tm local_tm_buf{};
+#ifdef _WIN32
+    localtime_s(&local_tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &local_tm_buf);
+#endif
     char timestamp[32];
-    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", local_tm);
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &local_tm_buf);
 
-    meta << "# Curcuma Calculation Metadata\n";
-    meta << "basename: " << basename << "\n";
-    meta << "method: " << method << "\n";
-    meta << "timestamp: " << timestamp << "\n";
-    meta << "input_file: " << input_file << "\n";
+    nlohmann::json j;
+    j["basename"] = basename;
+    j["method"] = method;
+    j["timestamp"] = std::string(timestamp);
+    j["input_file"] = input_file;
+    meta << j.dump(2) << "\n";
     meta.close();
 }
 

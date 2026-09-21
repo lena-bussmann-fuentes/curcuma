@@ -30,7 +30,7 @@
 #include "src/core/energy_calculators/ff_methods/ff_workspace.h"  // Claude Generated (Mar 2026): Unified workspace
 #include "src/core/energy_calculators/ff_methods/eeq_solver.h"  // EEQ charge calculation (Dec 2025 - Phase 3)
 #include "src/core/energy_calculators/ff_methods/huckel_solver.h"  // Full Hückel calculation (Jan 2026 - Phase 1)
-#include "src/core/energy_calculators/ff_methods/d4param_generator.h"  // Claude Generated (Feb 15, 2026): D4 for dc6dcn gradient
+#include "src/core/energy_calculators/dispersion/d4param_generator.h"  // Claude Generated (Feb 15, 2026): D4 for dc6dcn gradient
 #include "src/core/energy_calculators/ff_methods/alpb_solvation.h"  // Claude Generated (Mar 2026): ALPB solvation
 #include "src/core/global.h"
 #include "src/core/functional_groups.h"
@@ -185,9 +185,16 @@ struct GFNFFParamGenReport {
     double t_eeq_phase1         = -1;
     double t_eeq_phase1_corr    = -1;
     double t_eeq_phase2         = -1;
-    double t_pi_bond_orders     = -1;
+    // A0 (Jul 2026): the old single `t_pi_bond_orders` bucket bracketed three
+    // unrelated pieces of work, which made it useless for guiding optimisation.
+    // Split into the ipis per-pi-system EEQ re-solves, the FT-HMO solve itself,
+    // and the bond-type classification loop.
+    double t_pi_charges_eeq     = -1;
+    double t_huckel             = -1;
+    double t_bond_types         = -1;
     double t_topo_distances     = -1;
     double t_topology_total     = -1;
+    int    n_pi_systems         = -1;  // number of pi-systems (drives the two above)
 
     // Parameter generation phases — all measured in generateGFNFFParameterSet
     double t_bonds       = -1;
@@ -213,14 +220,21 @@ void printGFNFFParamGenReport(const GFNFFParamGenReport& r);
 
 // P2b (Apr 2026): CN cutoff parameters — configurable via CLI
 // Three modes:
-//   cn_cutoff_bohr > 0: Neighbor-list mode (default 6.0 Bohr, fast O(N*k))
+//   cn_cutoff_bohr > 0: Neighbor-list mode (default 10.0 Bohr, fast O(N*k))
 //   cn_cutoff_bohr = 0, cn_accuracy > 0: Fortran accuracy-based threshold (cnthr = 100 - log10(acc)*50)
 //   cn_cutoff_bohr = 0, cn_accuracy = 0: Full O(N²) reference mode (no cutoff)
+// FIX (Jul 23, 2026): default raised 6.0 -> 10.0 Bohr. The reference cnthr
+// (gfnff_param.f90:551, accuracy=1) is 100 Bohr^2 = 10 Bohr; the old 6.0 Bohr was
+// TIGHTER than the reference and truncated erf-CN contributions for heavy/metal atoms
+// (large covalent radii push the erf transition past 6 Bohr). That gave a wrong
+// dynamic-bond-r0 CN in the FFWorkspace energy path — e.g. PR23 (Ir complex) bond
+// energy +1.63 kcal. At 10 Bohr the CN is converged and matches the reference; the SP
+// bond energy is bit-identical to the legacy per-bond path (which used the full CN).
 BEGIN_PARAMETER_DEFINITION(gfnff)
 PARAM(accuracy, String, "normal", "Accuracy profile: loose|normal|medium|high. Maps to EEQ and CN parameters.", "Basic", {})
 PARAM(allow_unconverged_charges, Bool, false, "Allow calculation to continue with unconverged EEQ charges (warn instead of abort).", "Advanced", {})
 PARAM(skip_phase2, Bool, false, "Skip Phase 2 EEQ refinement and use Phase 1 topology charges directly. Faster but less accurate.", "Advanced", {})
-PARAM(cn_cutoff_bohr, Double, 6.0, "CN neighbor list cutoff radius in Bohr. 0 = use accuracy-based threshold instead.", "Advanced", {})
+PARAM(cn_cutoff_bohr, Double, 10.0, "CN neighbor list cutoff radius in Bohr (reference cnthr=100 Bohr^2=10 Bohr). 0 = use accuracy-based threshold instead.", "Advanced", {})
 PARAM(cn_accuracy, Double, 1.0, "CN accuracy for threshold calculation (cnthr = 100 - log10(acc)*50). Only used when cn_cutoff_bohr = 0. Set to 0 for full O(N^2) reference mode.", "Advanced", {})
 PARAM(solve, String, "auto",
       "EEQ solver method: lu, schur_cholesky, pcg, auto. Passed to eeq_solver.", "Algorithm", {})
@@ -250,6 +264,8 @@ PARAM(static_all, Bool, false,
 PARAM(eeq_distance_cutoff_auto, Bool, false,
       "Auto-enable eeq_distance_cutoff=30 Bohr after Phase-1 when nfrag==1 and max|q|<0.5 e. Saves ~12 ms/step polymer. Falls back to 0.0 for ionic/multi-fragment systems.", "Performance", {})
 PARAM(dispersion_cutoff_bohr, Double, 0.0, "Cutoff (Bohr) for D4 dispersion pair-list. 0 = full O(N^2) (Fortran-parity). Recommended for large systems: 15.0. Energy drift < 1 muEh at 15 Bohr. When active, CN-derivative stencil is extended to cover the cutoff range.", "Performance", {})
+PARAM(disp_half_contraction, Bool, true,
+      "Lever 3 Opt B: per-atom half-contraction fast path for the D4 dispersion C6 and dc6dcn build. About 7x faster inner contraction on large systems; reassociates the FP sum at ~1e-16 so energy matches to ~1e-10 Eh and gradient to ~1e-7. Set false for strictly bit-identical reproductions.", "Performance", {})
 PARAM(eeq_refactor_eps_bohr, Double, 0.05,
       "WP-EEQ-Cache: EEQ Cholesky refactorization threshold (max atom displacement, Bohr). "
       "Skips O(N^3) factorization when geometry change below this. "
@@ -259,10 +275,68 @@ PARAM(eeq_refactor_force_every, Int, 0,
       "WP-EEQ-Cache: Force EEQ Cholesky refactorization every N steps. "
       "0 = geometry-triggered only. Recommended: 100 for long MD. "
       "Forwarded to eeq_solver.eeq_refactor_force_every.", "Performance", {})
+PARAM(eeq_refine_iters, Int, 1, "A4: iterative-refinement steps when the EEQ solve reuses a cached Cholesky factor. Keeps charges exact for the current geometry at O(N^2) cost, so a loose refactor threshold does not corrupt the gradient. 0 disables. Forwarded to eeq_solver.eeq_refine_iters.", "Performance", {})
+// NOTE: each PARAM is kept on a SINGLE line on purpose. The param_parser clears its
+// buffer on the first ')' it sees, so a multi-line PARAM whose help text contains '(...)'
+// is silently dropped from the registry (see eeq_refactor_* above). Single-line is safe.
+PARAM(gpu_cn_pair_regen, Bool, true, "Task 10: regenerate the GPU CN-derivative pair list when the topology-displacement check fires (atoms moved past 0.5 Bohr). true keeps the list fresh during opt/MD; false reverts to the legacy build-once-and-latch behaviour.", "Performance", {})
+PARAM(gpu_cn_pair_regen_every, Int, 0, "Task 10: force GPU CN-derivative pair-list regeneration every N gradient steps (0 = topology-triggered only). MD safety net for slow drift below the displacement threshold.", "Performance", {})
+PARAM(gpu_cn_pair_cutoff_factor, Double, 2.5, "Task 10: GPU CN-derivative pair-list cutoff = factor*(rcov_i+rcov_j). Default 2.5 (erf-CN derivative ~exp(-126) beyond this). Larger = more pairs toward the CPU 40 Bohr reach and slower; smaller = faster with more truncation error.", "Performance", {})
+PARAM(hb_accuracy, Double, 0.1, "Task 11: HB-list accuracy driving the Fortran thresholds hbthr1 = 200 - log10(acc)*50, hbthr2 = 400 - log10(acc)*50 (Bohr^2). Smaller = larger cutoffs = more HB pairs = more accurate but slower. 0.1 reproduces the gfnff reference.", "Performance", {})
+PARAM(hb_thr1_bohr2, Double, 0.0, "Task 11: direct override of hbthr1, the A-B distance-squared cutoff for nhb2 detection (Bohr^2). 0 = derive from hb_accuracy.", "Performance", {})
+PARAM(hb_thr2_bohr2, Double, 0.0, "Task 11: direct override of hbthr2, the A-H-B sum-of-squares cutoff for nhb1 detection (Bohr^2). 0 = derive from hb_accuracy.", "Performance", {})
+PARAM(hb_update_rmsd_bohr, Double, 0.3, "Task 11: per-atom RMSD (Bohr) that triggers an HB/XB list rebuild. 0.3 reproduces the gfnff reference (gfnff_ini2.f90:717). Smaller = rebuild more often = less near-threshold staleness in MD but slower.", "Performance", {})
+PARAM(hb_update_force_every, Int, 0, "Task 11: force an HB/XB list rebuild every N gradient steps (0 = RMSD-triggered only). Use for continuous MD where near-threshold pairs must be re-classified promptly.", "Performance", {})
+PARAM(eeq_mixed_precision, Bool, false, "WP-B GPU only: factor the EEQ Coulomb matrix in FP32 then refine the solution with the FP64 residual, dsposv-style, for full FP64 accuracy at a fraction of the FP64-factor cost on FP64-weak GPUs. Opt-in on CUDA and ROCm (default OFF; enable per card after measuring). Applies to the factor-dominated few-fragment solve paths; the many-fragment general path stays FP64.", "Performance", {})
+PARAM(eeq_mixed_precision_iters, Int, 2, "WP-B GPU only: number of FP64-residual / FP32-correction refinement steps for eeq_mixed_precision. Minimum 1. Two steps reach FP64 accuracy on the validation set.", "Performance", {})
+PARAM(gpu_disp_pairs_on_device, Bool, false, "WP-A GPU only: build the D4 dispersion pair list on the device via a two-pass enumeration plus per-pair C6 contraction, replacing the host O(N^2) GenerateDispersionPairsNative loop and the per-build H2D upload. Default OFF keeps the proven host build. Bit-identical to the host list up to the FP order of the device Gaussian weights.", "Performance", {})
+PARAM(eeq_rocm_cpu_fragment_threshold, Int, 16, "ROCm GFN-FF only: fragment count at or above which the device EEQ solve is replaced by the exact CPU PCG block-Jacobi warm-start solver, whose O(N^2 k) cost beats the device dense N x N Cholesky O(N^3) for solvent boxes and keeps ROCm charges identical to the CPU path. Set 0 to always use the device solve.", "Performance", {})
+// Implicit solvation (WP5, Claude Generated June 2026). Registering these here is
+// what makes -gfnff.solvent reach GFNFF::InitialiseMolecule (the value was silently
+// ignored before, since the gfnff module declared no solvent PARAM). Use the dotted
+// -gfnff.solvent form; the flat -solvent is ambiguous across providers.
+PARAM(solvent, String, "none",
+      "Implicit solvent for the native GFN-FF ALPB/GBSA model (e.g. 'water', 'dmso', "
+      "'acetone', 'chloroform'). 'none' (default) runs gas phase. Born electrostatics "
+      "at the EEQ charges + CDS surface term + state shift; the reaction field is a "
+      "post-hoc add-on (the EEQ charges do not yet feel the solvent). Use the dotted "
+      "-gfnff.solvent (the flat -solvent is ambiguous across providers).", "Solvation", {})
+PARAM(solvent_model, String, "alpb",
+      "GFN-FF implicit solvation model: 'alpb' (default, P16 Born kernel) or 'gbsa' "
+      "(Still kernel, no shape term). CPCM is not implemented natively. Legacy numeric "
+      "codes (2=gbsa, 3=alpb) are also accepted.", "Solvation", {})
+// React topology mode (Claude Generated Aug 2026): event-driven reactive bond topology.
+// Bonds may form and break during MD; all bonded terms are rebuilt at change events.
+// See docs/GFNFF_REACT_TOPOLOGY.md. PARAMs stay single-line, see note above.
+PARAM(topology_mode, String, "auto", "Topology mode: auto = adaptive two-tier caching, constant = frozen after init, react = bond topology is re-detected with hysteresis during MD and all bonded terms are rebuilt at change events. default is accepted as an alias for auto.", "Basic", {})
+PARAM(react_bond_form_factor, Double, 1.6, "React mode: a non-bonded pair becomes a bond when r < factor * covalent-radius sum * element fat scaling. Optimistic on purpose: the Gaussian bond well is weak at this distance and formation is expected mid-collision. Must stay below react_bond_break_factor and below typical hydrogen-bond contact distances.", "Reactive", {})
+PARAM(react_bond_break_factor, Double, 2.6, "React mode: an existing bond is removed when r > factor * covalent-radius sum * element fat scaling. Conservative on purpose: the bond is kept until its Gaussian well has largely decayed, so removal causes only a small energy jump. The wide gap to react_bond_form_factor is the hysteresis that prevents flicker.", "Reactive", {})
+PARAM(react_check_every, Int, 5, "React mode: run the O N^2 hysteresis bond scan every N energy calls. 0 = displacement-triggered only.", "Reactive", {})
+PARAM(react_check_disp_bohr, Double, 0.25, "React mode: also run the bond scan when any atom moved more than this distance in Bohr since the last scan. 0 disables the displacement trigger.", "Reactive", {})
+PARAM(react_refractory_scans, Int, 10, "React mode: a pair whose bond just broke may not re-form for this many scans. Interrupts the form/break cycle that otherwise pumps the recombination energy through the thermostat over and over. 0 disables.", "Reactive", {})
+PARAM(react_valence_cap, Bool, true, "React mode: refuse a new bond while an atom already uses its element valence plus one exchange slack, counting bond orders so multiple bonds consume valence. Prevents unphysical agglomerates; disable to sample unconstrained formation. Refused formations are logged at verbosity 2.", "Reactive", {})
+PARAM(react_exchange_scans, Int, 20, "React mode: an atom may stay above its nominal valence for at most this many scans, then its weakest bond is broken. Forces exchange intermediates like a hydrogen bridging two heavy atoms to resolve instead of staying geometrically locked. 0 disables.", "Reactive", {})
+PARAM(react_slack_form_factor, Double, 1.2, "React mode: tighter formation radius factor for bonds that push an atom above its nominal sigma valence into the exchange slack. A genuine exchange intermediate has the extra partner near bond distance; the ordinary optimistic factor would re-create bridges endlessly.", "Reactive", {})
 END_PARAMETER_DEFINITION
 
 class GFNFF {
 public:
+    /// Test hook: #EEQ PCG solves that used the multi-step warm-start extrapolation
+    /// (eeq_extrapolation). 0 with the default 'none'. Claude Generated.
+    long eeqPcgExtrapolationCount() const {
+        return m_eeq_solver ? m_eeq_solver->pcgExtrapolationCount() : -1;
+    }
+
+    /// Test hook: drop the EEQ Cholesky/matrix caches, exactly as getCachedTopology()
+    /// does before a full topology rebuild. Lets the re-entrancy regression test
+    /// reproduce the MD/opt rebuild path in-process. Claude Generated (Jul 2026).
+    void invalidateEEQCachesForTest() {
+        if (m_eeq_solver) {
+            m_eeq_solver->invalidateCholeskyCache();
+            m_eeq_solver->invalidateMatrixCache();
+        }
+    }
+
     /**
      * @brief Static topology data — computed once at initialization, never changes
      *
@@ -277,6 +351,8 @@ public:
         Vector neighbor_counts;                                  // Simple neighbor counts (integer CN)
         std::vector<int> hybridization;                          // 0=sp3, 1=sp, 2=sp2, 3=terminal, 5=hypervalent
         std::vector<int> pi_fragments;                           // Pi fragment assignment per atom
+        std::vector<int> itag;                                   // -1 iff atom is eta-coordinated to a metal (Fortran itag; gfnff_ini2.f90:170-198) - Claude Generated Jul 2026
+        std::vector<int> pi_system_charge;                       // ipis: charge per pi-system (subtract from nelpi) - Claude Generated Jul 2026
         std::vector<int> ring_sizes;                             // Smallest ring containing each atom
         std::vector<bool> is_metal;                              // Metal atom flags
         std::vector<bool> is_aromatic;                           // Aromatic atom flags
@@ -286,6 +362,14 @@ public:
         std::vector<std::vector<int>> neighbor_lists;            // Full neighbor connectivity
         std::vector<std::vector<int>> adjacency_list;            // Per-atom bonded neighbor list
         std::vector<std::vector<int>> topo_distances;            // N×N shortest-path bond counts
+
+        // Fortran multi-list neighbour construction (gfnff_ini2.f90:128-130, 197-202).
+        // Fortran keeps four lists and assigns hybridization from the metal-reduced,
+        // eta-aware mixture rather than from the full connectivity. Claude Generated (Jul 2026).
+        std::vector<std::vector<int>> nb_full;                   // nbf: getnb(icase=1), no filtering
+        std::vector<std::vector<int>> nb_hc;                     // topo%nb DURING the hyb loop: getnb(icase=2), drops all bonds of highly-coordinated atoms
+        std::vector<std::vector<int>> nb_nometal;                // nbm: getnb(icase=3), metals + unusually coordinated heavy atoms removed
+        std::vector<double> metallic_character;                  // mchar (gfnff_ini.f90:249), gates the nbm metal filter
 
         // Functional groups
         std::vector<FunctionalGroupType> functional_groups;      // Per-atom classification
@@ -621,6 +705,12 @@ public:
      */
     const TopologyInfo& getTopologyInfo() const { return getCachedTopology(); }
 
+    /// WP-A (Jun 2026): set by the GPU method when gpu_disp_pairs_on_device is on, so
+    /// the host D4 generator computes only CN + Gaussian weights and skips its O(N^2)
+    /// pair loop (the GPU builds the pair list on device). Must be set before
+    /// InitialiseMolecule. No effect on the CPU path.
+    void setSkipHostDispPairs(bool v) { m_skip_host_disp_pairs = v; }
+
     /**
      * @brief Export topology information for restart/topology I/O
      * @return JSON object with topology data (fragments, charges, hybridization, CN)
@@ -659,7 +749,14 @@ public:
      * @brief Calculate full topology information for advanced parametrization
      * @return Complete topology information
      */
+    /// Full topology build. Runs calculateTopologyInfoOnce() twice, mirroring Fortran's
+    /// q-loop (gfnff_ini.f90:258-263): pass 1 with qa=0, pass 2 with the pass-1 charges
+    /// shrinking the bond radii. Claude Generated (Jul 2026).
     TopologyInfo calculateTopologyInfo() const;
+
+    /// One pass of the topology build (bond list -> four neighbour lists -> hybridization
+    /// -> rings/pi/EEQ). Uses m_bond_qa for the getnb radius shrink.
+    TopologyInfo calculateTopologyInfoOnce() const;
 
     /**
      * @brief Generate GFN-FF parameters as native C++ structs (no JSON)
@@ -686,6 +783,17 @@ public:
      * subsequent calls return nullptr.
      */
     std::unique_ptr<GFNFFParameterSet> consumeCachedParameterSet() { return std::move(m_cached_parameter_set); }
+
+    /**
+     * @brief Heap clone of the current cached parameter set.
+     *
+     * Claude Generated (Aug 2026): for consumers that must not steal the cached copy,
+     * e.g. the GPU wrapper rebuilding its device workspace after a react-mode topology
+     * change. Returns nullptr if no set is cached.
+     */
+    std::unique_ptr<GFNFFParameterSet> cloneCachedParameterSet() const {
+        return m_cached_parameter_set ? std::make_unique<GFNFFParameterSet>(*m_cached_parameter_set) : nullptr;
+    }
 
     // === GPU orchestration helpers (Claude Generated March 2026) ===
     // These expose internal CN/EEQ computation so that GGFNFFComputationalMethod
@@ -793,6 +901,31 @@ public:
         return r;
     }
 
+    // === React topology mode (Claude Generated Aug 2026) ===
+    // Event-driven reactive bond topology: the bond list is re-detected with a distance
+    // hysteresis during MD and all bonded terms (bonds, angles, torsions, inversions)
+    // plus the bonded/non-bonded repulsion partition are rebuilt when it changes.
+    // Active only for topology_mode == "react". See docs/GFNFF_REACT_TOPOLOGY.md.
+
+    /**
+     * @brief Run the react-mode bond scan and rebuild all bonded terms if the bond set changed.
+     *
+     * No-op unless topology_mode == "react". Called at the start of Calculation() so
+     * EEQ constraints, HB/XB detection and all force-field terms see the new topology
+     * within the same step.
+     */
+    void updateReactiveTopologyIfNeeded();
+
+    /// One-shot: true if updateReactiveTopologyIfNeeded() rebuilt the topology since the
+    /// last call. Consumed by the GPU/HIP wrappers to trigger a device workspace rebuild.
+    bool consumeReactRebuild() { bool r = m_react_rebuilt; m_react_rebuilt = false; return r; }
+
+    /// Current authoritative react-mode bond set (canonical i<j pairs). Empty unless react mode.
+    const std::vector<std::pair<int,int>>& reactiveBonds() const { return m_react_bonds; }
+
+    /// Number of bonded-term rebuilds since initialisation (react mode).
+    int reactiveRebuildCount() const { return m_react_rebuild_count; }
+
     const std::vector<GFNFFHydrogenBond>& getLastHBonds() const { return m_last_hbonds; }
     const std::vector<GFNFFHalogenBond>& getLastXBonds() const { return m_last_xbonds; }
 
@@ -825,6 +958,15 @@ public:
     // Getters for CN/EEQ results (valid after prepareCNAndEEQ)
     const Vector& getLastCN() const { return m_last_cn; }
     const Vector& getLastCharges() const { return m_charges; }
+
+    // F-Q4 (Claude Generated): true iff the most recent InitialiseMolecule/Calculation
+    // had the EEQ solver fall back to uniform/placeholder charges. The wrapper refuses
+    // the result instead of returning a Coulomb energy built on wrong charges.
+    // m_eeq_solve_failed is the sticky init-time flag (cleared per molecule); the live
+    // solver flag catches per-step (opt/MD) fallbacks (cleared at each Calculation).
+    bool eeqSolveFailed() const {
+        return m_eeq_solve_failed || (m_eeq_solver && m_eeq_solver->lastSolveFailed());
+    }
     // WP-G fix (May 2026): m_geometry_bohr is GeoGradMatrix (RowMajor). Returning
     // `const Matrix&` was creating a dangling reference to a temporary produced by
     // Eigen's implicit storage-order conversion — segfaulted in the GPU path
@@ -1143,9 +1285,13 @@ private:
      * @return JSON array of dispersion pair parameters
      *
      * Claude Generated (December 2025): D3/D4 integration
-     * - Calls D4ParameterGenerator if USE_D4 defined (preferred)
-     * - Falls back to D3ParameterGenerator if USE_D3 defined
-     * - Final fallback to generateFreeAtomDispersion()
+     * - Default (`gfnff`): ALWAYS uses the self-contained D4ParameterGenerator
+     *   (Casimir-Polder C6, `dispersion/d4param_generator`, compiled unconditionally into
+     *   curcuma_core). It is NOT gated by USE_D4 and does NOT use the external dftd4interface
+     *   / curcuma_d4 / LAPACKE lib — that flag only controls the standalone `-d4` method.
+     * - `gfnff-d3` selects the native D3ParameterGenerator instead.
+     * - generateFreeAtomDispersion() is a last-resort fallback, reached only if D4
+     *   construction throws (its "compile with USE_D4" hint does not apply to GFN-FF).
      */
     json generateGFNFFDispersionPairs() const;
 
@@ -1702,6 +1848,96 @@ private:
     std::vector<std::vector<int>> buildNeighborLists() const;
 
     /**
+     * @brief Detect eta(η)-coordinated atoms (metal-alkene/alkyne/Cp side-on bonding)
+     *
+     * Claude Generated (July 2026). Faithful port of the Fortran etacoord logic
+     * (external/gfnff/src/gfnff_ini2.f90:170-198). Sets itag[i] = -1 for genuine
+     * η-coordinated carbons (only ati<=10, in practice C), -1 otherwise 0. Used by
+     * the angle-bending feta metal correction so it fires ONLY for real η ligands
+     * (metal-alkene/alkyne/cyclopentadienyl), NOT σ-bonded π ligands like CO.
+     *
+     * @param neighbor_lists Full bonded adjacency (== Fortran nbf, includes metals)
+     * @return itag vector (size m_atomcount): -1 if η-coordinated, else 0
+     */
+    std::vector<int> computeEtaCoordination(const std::vector<std::vector<int>>& neighbor_lists) const;
+
+    /**
+     * @brief Estimate per-atom "metallic character" mchar
+     *
+     * Claude Generated (July 2026). Port of external/gfnff/src/gfnff_ini.f90:243-250:
+     *   mchar(i) = exp(-0.005 * en(Z_i)^8) * dum2 / (cn(i) + 1)
+     * where dum2 = sum_j || d logCN_i / d R_j || over the GFN-FF logistic CN
+     * (gfnff_cn.f90:gfnff_dlogcoord). Used only to gate the metal filter of the
+     * metal-reduced neighbour list nbm (getnb icase=3: mchar > 0.25 => drop).
+     *
+     * The exp(-0.005*en^8) factor is extremely stiff (en=2.0 -> 0.28, en=3.0 -> ~0),
+     * so it acts as a near-hard electronegativity switch around en ~ 2.4.
+     *
+     * NOTE: uses GFNFFParameters::gfnff_en (Fortran param%en), NOT the rab_en table.
+     *
+     * @return mchar per atom (size m_atomcount)
+     */
+    std::vector<double> computeMetallicCharacter() const;
+
+    /**
+     * @brief Build the Fortran four-list neighbour set (nbf / topo%nb / nbm / nbdum)
+     *
+     * Claude Generated (July 2026). Port of external/gfnff/src/gfnff_ini2.f90:128-130
+     * and 197-202. Fortran derives three lists from the same distance criterion and
+     * then assigns hybridization from a per-atom mixture:
+     *   nbf   (icase=1) full connectivity, no filtering
+     *   nb_hc (icase=2) drops ALL bonds of highly-coordinated atoms
+     *                   (hc_crit = 4 if group <= 2 - which includes every transition
+     *                    metal, since periodic_group is negative for the d-block - else 6)
+     *   nbm   (icase=3) drops metals (mchar > 0.25 or metal_type > 0) and heavy atoms
+     *                   above their normal CN (nbf > normcn and Z > 10)
+     *   nbdum          per-atom mixture: nbm for eta-coordinated atoms, else nbf
+     *
+     * Fills topo.nb_full / nb_hc / nb_nometal / metallic_character / itag. The mixture
+     * is what Fortran finally stores as topo%nb (gfnff_ini2.f90:335).
+     *
+     * @param topo Topology to populate (nb_full etc. are overwritten)
+     * @param[out] nbdum The per-atom eta-aware mixture (Fortran's final topo%nb)
+     */
+    void buildNeighborListSet(GFNFFTopology& topo, std::vector<std::vector<int>>& nbdum) const;
+
+    /**
+     * @brief CN of the nearest non-metal neighbour of an atom
+     *
+     * Claude Generated (July 2026). Port of gfnff_ini2.f90:431-450 (nn_nearest_noM).
+     * Fortran calls this with topo%nb, i.e. the HC-filtered list nb_hc.
+     *
+     * @param ii Atom index
+     * @param nb Neighbour list to search (pass nb_hc for Fortran parity)
+     * @param distance_matrix Interatomic distances
+     * @return CN of the closest non-metal neighbour, or 0 if there is none
+     */
+    int nnNearestNoM(int ii, const std::vector<std::vector<int>>& nb,
+                     const Eigen::MatrixXd& distance_matrix) const;
+
+    /**
+     * @brief Fortran-faithful hybridization assignment
+     *
+     * Claude Generated (July 2026). Transcription of gfnff_ini2.f90:211-333, replacing
+     * the geometry-first heuristic in determineHybridization(). Reads the four-list
+     * neighbour set: nb20i from the nbdum mixture, nbdiff/nbmdiff from nbf vs nb_hc/nbm,
+     * and indexes the NO2/B-N/N-SO2 and CO->sp rules into nb_hc (which is what Fortran's
+     * topo%nb still holds at this point in the initialization).
+     *
+     * Also WRITES itag: sets +1 for carbenes and NO2 nitrogen (consumed by Hueckel/HB),
+     * on top of the -1 eta tags already set by computeEtaCoordination().
+     *
+     * @param topo Topology holding nb_full / nb_hc / nb_nometal / distance_matrix
+     * @param nbdum The eta-aware per-atom mixture
+     * @param itag In/out tag vector (-1 eta in, +1 carbene/NO2 out)
+     * @return Hybridization per atom (0 none/octahedral, 1 sp, 2 sp2, 3 sp3, 5 hypervalent)
+     */
+    std::vector<int> determineHybridizationFortran(const GFNFFTopology& topo,
+                                                   const std::vector<std::vector<int>>& nbdum,
+                                                   const Eigen::MatrixXd& distance_matrix,
+                                                   std::vector<int>& itag) const;
+
+    /**
      * @brief Count neighbors within 20 Bohr cutoff (nb20)
      *
      * Claude Generated (January 14, 2026) - Phase 2: Exact nb20 implementation
@@ -1751,7 +1987,9 @@ private:
         const std::vector<int>& hybridization,
         const std::vector<int>& pi_fragments,
         const std::vector<double>& charges = {},
-        const Eigen::MatrixXd& geometry_bohr = Eigen::MatrixXd()) const;
+        const Eigen::MatrixXd& geometry_bohr = Eigen::MatrixXd(),
+        const std::vector<int>& pi_system_charge = {},
+        const std::vector<int>& itag = {}) const;
 
     /**
      * @brief Calculate EEQ electrostatic energy
@@ -2329,6 +2567,7 @@ private:
 
     // EEQ charge calculation (Dec 2025 - Phase 3: Extraction and delegation)
     std::unique_ptr<EEQSolver> m_eeq_solver; ///< Standalone EEQ solver (replaces embedded EEQ code)
+    mutable bool m_eeq_solve_failed = false; ///< F-Q4: EEQ fell back to placeholder charges (fail-loud)
 
     // Hückel solver for π-bond orders (Jan 2026 - Phase 1: Full Hückel implementation)
     std::unique_ptr<HuckelSolver> m_huckel_solver; ///< Full iterative Hückel solver
@@ -2346,6 +2585,7 @@ private:
     // Initialized when solvent != "none", called in Calculation() after EEQ charges
     std::unique_ptr<ALPBSolvation> m_solvation;
     std::string m_solvent = "none";  ///< Solvent name ("none" = gas phase)
+    std::string m_solvent_model_label = "ALPB";  ///< "ALPB" | "GBSA" for logging (WP5)
 
     /**
      * @brief HB/XB dynamic update support for MD simulations
@@ -2453,11 +2693,53 @@ private:
     mutable std::optional<bool> m_external_topology_decision; ///< GPU displacement check result
     mutable std::optional<std::vector<std::pair<int,int>>> m_cached_bond_list;
 
+    std::vector<std::pair<int,int>> m_forced_bonds; ///< External bonds merged with geometric detection
+
+    // React topology mode state (Claude Generated Aug 2026). See docs/GFNFF_REACT_TOPOLOGY.md.
+    std::vector<std::pair<int,int>> m_react_bonds; ///< Authoritative bond set (canonical i<j), owns m_forced_bonds in react mode
+    Eigen::MatrixXd m_react_ref_geometry; ///< Geometry (Bohr) at the last hysteresis scan
+    long m_react_calls = 0; ///< Energy calls since init (drives the scan cadence)
+    int m_react_rebuild_count = 0; ///< Bonded-term rebuilds so far
+    bool m_react_rebuilt = false; ///< One-shot flag consumed by the GPU/HIP wrappers
+    double m_react_form_factor = 1.6; ///< Bond-formation threshold factor (optimistic)
+    double m_react_break_factor = 2.6; ///< Bond-keeping threshold factor (conservative)
+    int m_react_check_every = 5; ///< Scan every N energy calls (0 = displacement only)
+    double m_react_check_disp = 0.25; ///< Scan when any atom moved more than this (Bohr)
+    int m_react_refractory_scans = 10; ///< Scans a broken pair must wait before re-forming
+    bool m_react_valence_cap = true; ///< Enforce the bond-order-aware valence cap on formation
+    int m_react_exchange_scans = 20; ///< Max scans an atom may stay over nominal valence
+    double m_react_slack_form_factor = 1.2; ///< Tighter formation radius for slack-consuming bonds
+    std::map<int, int> m_react_overvalence_streak; ///< Atom -> consecutive over-valent scans
+    std::map<std::pair<int, int>, int> m_react_refractory; ///< Pair -> remaining blocked scans
+
+    /**
+     * @brief React mode: O(N^2) hysteresis scan over all atom pairs; updates m_react_bonds.
+     * An existing bond survives while r < break_factor*thr; a new pair becomes a bond
+     * at r < form_factor*thr, with thr = (rcov_i+rcov_j)*fat_i*fat_j.
+     * @return true if the bond set changed
+     */
+    bool detectReactiveBondChanges();
+
+    /**
+     * @brief React mode: regenerate ALL bonded terms, the repulsion partition, Coulomb
+     * parameters and HB/XB lists from the current m_react_bonds; push into both engines.
+     * @return true on success
+     */
+    bool rebuildReactiveTopology();
+
+    /**
+     * @brief Push a generated parameter set into the legacy ForceField engine
+     * (parameters + Phase-1 topology charges + CN/CNF/dcn). Shared by
+     * initializeForceField() and rebuildReactiveTopology().
+     */
+    void syncLegacyForceField(const GFNFFParameterSet& ff_params);
+
     // Topology caching mode: "auto" (two-tier caching) or "constant" (never recalculate)
     std::string m_topology_mode = "auto";
 
     // Claude Generated (March 2026): Topology persistence in param.json
     bool m_cache_topology = true;   ///< Cache Phase-1 EEQ topology in param.json (opt-out)
+    bool m_skip_host_disp_pairs = false;  ///< WP-A: GPU builds D4 pairs; skip host O(N^2) loop
     bool m_print_timing = true;     ///< Print init timing summary at verbosity >= 1
 
     // Claude Generated (April 2026): Timing for consolidated summary
@@ -2483,11 +2765,23 @@ private:
     std::vector<GFNFFHalogenBond> m_last_xbonds;
     bool m_hbxb_updated = false;  ///< True if updateHBXBIfNeeded() ran since last check
     bool m_hbxb_fresh = false;    ///< True if HB/XB lists were freshly built during init and geometry is unchanged
+    long m_hbxb_update_calls = 0; ///< Task #11: call counter for hb_update_force_every periodic rebuild
 
     // Claude Generated (March 2026): State from last prepareCNAndEEQ() call
     Vector m_last_cn;    ///< Coordination numbers
     Vector m_last_cnf;   ///< CN-dependent EEQ factors per atom
     bool m_gpu_path_preallocated = false; ///< True after preAllocateForGPUPath()
+
+    /// Use the Fortran-faithful hybridization (determineHybridizationFortran) instead of
+    /// the legacy geometry-first heuristic. Set false to fall back to the pre-Jul-2026
+    /// behaviour for bisection. Claude Generated (Jul 2026).
+    bool m_use_fortran_hyb = true;
+
+    /// Topology charges (Fortran topo%qa) fed back into the getnb bond-radius shrink
+    /// (`rtmp -= qa*fq`, gfnff_ini2.f90:122). Empty on the first pass, which is exactly
+    /// Fortran's pass 1 (gfnff_ini.f90:258 sets qa=0 before the q-loop). Filled by the
+    /// second q-loop pass. Claude Generated (Jul 2026).
+    mutable std::vector<double> m_bond_qa;
     CNDerivStore m_last_dcn; ///< CN derivatives (gradient only). Claude Generated (WP4, May 2026): pair-list replaces std::vector<SpMatrix>
 
     // WP-FF-DistMatrix-Sharing (May 2026): shared packed-triangular distance arrays.
