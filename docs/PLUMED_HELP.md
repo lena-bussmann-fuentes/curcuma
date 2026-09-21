@@ -48,15 +48,17 @@ Curcuma embeds PLUMED2 via its C wrapper API. Each MD step:
 | Quantity | Curcuma internal | Passed to PLUMED as | PLUMED unit | Factor |
 |----------|-----------------|--------------------|-------------|--------|
 | Energy   | Hartree          | Hartree            | kJ/mol      | 2625.5 |
-| Length   | Angstrom         | **Bohr**           | nm          | 0.0529 |
+| Length   | Angstrom         | Angstrom            | nm          | 0.1    |
 | Time     | fs              | fs                 | ps          | 1e-3   |
 | Mass     | amu             | amu                | amu         | 1      |
 | Charge   | e               | e                  | e           | 1      |
 | k_B*T    | Hartree          | Hartree            | kJ/mol      | 2625.5 |
 
-Positions are converted from Angstrom to Bohr before passing to PLUMED, so that the
-unit system (Bohr, Hartree, Hartree/Bohr) is consistent with the force array.
-For periodic systems, box vectors are also converted to Bohr and passed via `setBox`.
+`setPositions`/`setForces` receive curcuma's `m_eigen_geometry`/`m_eigen_gradient` arrays
+unmodified (Angstrom-based) — there is no in-place Bohr conversion step. PLUMED is told how
+to interpret them via a single scalar passed to `setMDLengthUnits` (Angstrom -> nm = 0.1);
+the same factor implicitly relates the force units (energyUnits / lengthUnits) since PLUMED
+derives those from the two scalars above.
 
 These conversions are handled internally; no user action required.
 

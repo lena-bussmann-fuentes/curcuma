@@ -67,6 +67,8 @@ capabilities/
   - ✅ VTF trajectory output for CG systems
   - ✅ Orientational dynamics infrastructure (prepared for Phase 6 ellipsoids)
   - ✅ CSV status output — per-step energies/temperatures to `<basename>.md.csv` in BMT dir (UTF-8, configurable delimiter) — see [docs/MD_CSV_OUTPUT.md](../../docs/MD_CSV_OUTPUT.md)
+  - ✅ **PLUMED `setMDLengthUnits` factor fixed (Sep 2026)**: was `10` (should be `0.1` = Å→nm, `CurcumaUnit::Length::angstrom_to_nm`); the reciprocal inflated every length-based COLVAR (DISTANCE, COM, ...) by 10x. Bug-reported (reproduced on 2 independent systems, factor exactly 10.00) and fixed at `simplemd.cpp` PLUMED init; `test_plumed_init.cpp` regression-checks the value now. 🤖 AI-fixed, machine-tested (build + ctest, no regression) — not yet human-tested against a real metadynamics run; the reported extreme PLUMED slowness (possibly a consequence of this bug) needs re-testing.
+  - ✅ **`-seed` not seeding MD stochastics — FIXED (Sep 2026)**: `InitVelocities()`/`Andersen()`/`CSVR()` (incl. the per-region thermostat paths) each held their own unseeded `static` RNG, so `-seed` had no effect and repeat runs were bitidentical. Consolidated into a single member `m_rng`, seeded from `m_seed` in `Initialise()`. 🤖 AI-fixed, machine-tested (build + ctest, no regression); verified manually that two `-seed` runs from the same start now diverge (previously identical).
 - **NEB Docking**: Nudged elastic band for transition state searches
 - **Trajectory Analysis**: Analysis tools for MD trajectories
 

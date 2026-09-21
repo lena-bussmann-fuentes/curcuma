@@ -599,6 +599,10 @@ private:
 
     int m_mtd_dT = -1;
     int m_seed = -1;
+    std::mt19937 m_rng; ///< Bug fix (Sep 2026): single RNG for all MD stochastics (velocity init,
+                        ///< Andersen, CSVR); seeded from m_seed in Initialise(). Do not declare
+                        ///< local static generators elsewhere in simplemd.cpp -- they bypass
+                        ///< -seed reproducibility (this is exactly what happened before the fix).
     int m_time_step = 0;
     int m_dof = 0;
     int m_mtd_time = 0, m_loop_time = 0;

@@ -49,6 +49,7 @@
 #include "src/core/global.h"
 #include "src/core/molecule.h"
 #include "src/core/parameter_registry.h"  // Claude Generated 2025: For ParameterRegistry::getInstance()
+#include "src/core/units.h"
 
 #include "src/tools/geometry.h"
 
@@ -616,8 +617,6 @@ bool SimpleMD::Initialise()
     m_eigen_masses = Eigen::VectorXd::Zero(3*m_natoms);
     m_eigen_inv_masses = Eigen::VectorXd::Zero(3*m_natoms);
 
-    static std::random_device rd{};
-    static std::mt19937 gen{ rd() };
     if (m_seed == -1) {
         const auto start = std::chrono::high_resolution_clock::now();
         m_seed = std::chrono::duration_cast<std::chrono::seconds>(start.time_since_epoch()).count();
@@ -625,7 +624,7 @@ bool SimpleMD::Initialise()
         m_seed = m_natoms * m_T0;
     if (m_verbosity >= 1)
         std::cout << "Random seed is " << m_seed << std::endl;
-    gen.seed(m_seed);
+    m_rng.seed(m_seed);
 
     if (m_initfile != "none") {
         json md;
@@ -713,7 +712,7 @@ bool SimpleMD::Initialise()
         m_seed = m_T0 * m_natoms;
     if (m_verbosity >= 1)
         std::cout << "Random seed is " << m_seed << std::endl;
-    gen.seed(m_seed);
+    m_rng.seed(m_seed);
 
 
     m_start_fragments = m_molecule.GetFragments();
@@ -1139,7 +1138,6 @@ void SimpleMD::InitConstrainedBonds()
 
 void SimpleMD::InitVelocities(double scaling)
 {
-    static std::default_random_engine generator;
     for (size_t i = 0; i < m_natoms; ++i) {
         // Claude Generated (Jun 2026): sample from m_T_init (initial
         // temperature) rather than m_T0 (thermostat target) so callers can
@@ -1147,9 +1145,9 @@ void SimpleMD::InitVelocities(double scaling)
         // touching the thermostat target. m_T_init defaults to m_T0 when
         // -initial_temperature is not set (backward compatible).
         std::normal_distribution<double> distribution(0.0, std::sqrt(kb_Eh * m_T_init * m_eigen_inv_masses.data()[3 * i]));
-        m_eigen_velocities.data()[3 * i + 0] = distribution(generator);
-        m_eigen_velocities.data()[3 * i + 1] = distribution(generator);
-        m_eigen_velocities.data()[3 * i + 2] = distribution(generator);
+        m_eigen_velocities.data()[3 * i + 0] = distribution(m_rng);
+        m_eigen_velocities.data()[3 * i + 1] = distribution(m_rng);
+        m_eigen_velocities.data()[3 * i + 2] = distribution(m_rng);
     }
 
     // Match per-step removal logic exactly so initial velocities are
@@ -2075,7 +2073,11 @@ void SimpleMD::prepareRun()
         m_plumedmain = plumed_create();
         int real_precision = 8;
         double energyUnits = 2625.5;
-        double lengthUnits = 10;
+        // Bug fix (Sep 2026): was 10 (inverted Bohr-scale guess); curcuma's MD geometry/gradient
+        // arrays are Angstrom-based, and PLUMED expects the code->nm conversion factor here, i.e.
+        // Angstrom->nm = 0.1, not its reciprocal. Confirmed empirically: a DISTANCE COLVAR was
+        // off by exactly 10x vs the coordinate-derived value before this fix.
+        double lengthUnits = CurcumaUnit::Length::angstrom_to_nm(1.0); // = 0.1
         double timeUnits = 1e-3;
         double massUnits = 1;
         double chargeUnit = 1;
@@ -2439,11 +2441,10 @@ void SimpleMD::ApplyThermostatRegion(const std::vector<int>& atoms, double T0, i
             return;
         const double Ekin_target = 0.5 * kb_Eh * T0 * dof;
         const double c = std::exp(-(m_dT / 2.0 * m_respa) / m_coupling);
-        static std::mt19937 gen{ std::random_device{}() };
         std::normal_distribution<double> dnorm{ 0.0, 1.0 };
         std::chi_squared_distribution<double> dchi{ static_cast<double>(dof) };
-        const double R = dnorm(gen);
-        const double SNf = dchi(gen);
+        const double R = dnorm(m_rng);
+        const double SNf = dchi(m_rng);
         const double alpha2 = c + (1 - c) * (SNf + R * R) * Ekin_target / (dof * Ekin)
             + 2 * R * std::sqrt(c * (1 - c) * Ekin_target / (dof * Ekin));
         const double alpha = std::sqrt(std::max(0.0, alpha2));
@@ -2454,15 +2455,14 @@ void SimpleMD::ApplyThermostatRegion(const std::vector<int>& atoms, double T0, i
             m_eigen_velocities.data()[3 * i + 2] *= alpha;
         }
     } else if (type == ThermostatType::Andersen) {
-        static std::default_random_engine generator;
         const double probability = m_andersen * m_dT;
         std::uniform_real_distribution<double> uniform_dist(0.0, 1.0);
         for (int i : atoms) {
-            if (uniform_dist(generator) < probability) {
+            if (uniform_dist(m_rng) < probability) {
                 std::normal_distribution<double> distribution(0.0, std::sqrt(kb_Eh * T0 * m_eigen_inv_masses.data()[3 * i]));
-                m_eigen_velocities.data()[3 * i + 0] = (m_eigen_velocities.data()[3 * i + 0] + distribution(generator)) / 2.0;
-                m_eigen_velocities.data()[3 * i + 1] = (m_eigen_velocities.data()[3 * i + 1] + distribution(generator)) / 2.0;
-                m_eigen_velocities.data()[3 * i + 2] = (m_eigen_velocities.data()[3 * i + 2] + distribution(generator)) / 2.0;
+                m_eigen_velocities.data()[3 * i + 0] = (m_eigen_velocities.data()[3 * i + 0] + distribution(m_rng)) / 2.0;
+                m_eigen_velocities.data()[3 * i + 1] = (m_eigen_velocities.data()[3 * i + 1] + distribution(m_rng)) / 2.0;
+                m_eigen_velocities.data()[3 * i + 2] = (m_eigen_velocities.data()[3 * i + 2] + distribution(m_rng)) / 2.0;
             }
         }
     }
@@ -4602,8 +4602,6 @@ void SimpleMD::CSVR()
 {
     double Ekin_target = 0.5 * kb_Eh * (m_T0)*m_dof;
     double c = exp(-(m_dT / 2.0 * m_respa) / m_coupling);
-    static std::default_random_engine rd{};
-    static std::mt19937 gen{ rd() };
     static std::normal_distribution<> d{ 0, 1 };
     // Lazy-reinit when m_dof changes (e.g. after RATTLE constraint setup or
     // first call with a different molecule). A stale static distribution with
@@ -4614,8 +4612,8 @@ void SimpleMD::CSVR()
         dchi = std::chi_squared_distribution<float>(static_cast<float>(m_dof));
         csvr_last_dof = m_dof;
     }
-    double R = d(gen);
-    double SNf = dchi(gen);
+    double R = d(m_rng);
+    double SNf = dchi(m_rng);
     double alpha2 = c + (1 - c) * (SNf + R * R) * Ekin_target / (m_dof * m_Ekin) + 2 * R * sqrt(c * (1 - c) * Ekin_target / (m_dof * m_Ekin));
     m_Ekin_exchange += m_Ekin * (alpha2 - 1);
     double alpha = sqrt(alpha2);
@@ -4631,15 +4629,14 @@ void SimpleMD::CSVR()
 
 void SimpleMD::Andersen()
 {
-    static std::default_random_engine generator;
     double probability = m_andersen * m_dT;
     std::uniform_real_distribution<double> uniform_dist(0.0, 1.0);
     for (size_t i = 0; i < m_natoms; ++i) {
-        if (uniform_dist(generator) < probability) {
+        if (uniform_dist(m_rng) < probability) {
             std::normal_distribution<double> distribution(0.0, std::sqrt(kb_Eh * m_T0 * m_eigen_inv_masses.data()[3 * i]));
-            m_eigen_velocities.data()[3 * i + 0] = (m_eigen_velocities.data()[3 * i + 0] + distribution(generator)) / 2.0;
-            m_eigen_velocities.data()[3 * i + 1] = (m_eigen_velocities.data()[3 * i + 1] + distribution(generator)) / 2.0;
-            m_eigen_velocities.data()[3 * i + 2] = (m_eigen_velocities.data()[3 * i + 2] + distribution(generator)) / 2.0;
+            m_eigen_velocities.data()[3 * i + 0] = (m_eigen_velocities.data()[3 * i + 0] + distribution(m_rng)) / 2.0;
+            m_eigen_velocities.data()[3 * i + 1] = (m_eigen_velocities.data()[3 * i + 1] + distribution(m_rng)) / 2.0;
+            m_eigen_velocities.data()[3 * i + 2] = (m_eigen_velocities.data()[3 * i + 2] + distribution(m_rng)) / 2.0;
             m_seed += 3;
         }
     }
