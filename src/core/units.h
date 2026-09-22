@@ -46,6 +46,16 @@ namespace Constants {
     // Time conversion factor
     constexpr double FS_TO_AMU = 41.34137314; // fs·amu conversion
     constexpr double ATOMIC_TIME_TO_FS = 24.188843265857; // aut to fs
+
+    // Claude Generated (Sep 2026): the time unit implied by the Angstrom / amu / Hartree unit
+    // system that SimpleMD integrates in. Velocities there are sqrt(Eh/amu) and coordinates are
+    // Angstrom, so the step that multiplies them is NOT one femtosecond but
+    //     sqrt(amu * A^2 / Eh) = 1.9516144 fs.
+    // Every user-facing time (-dt, -MaxTime, -coupling, the Time column) is in real
+    // femtoseconds and is converted with these constants at the point where it enters or
+    // leaves the integrator. Ported from upstream ef462fcf.
+    constexpr double MD_TIME_UNIT_FS = 1.9516144204; // sqrt(amu*A^2/Eh) in fs
+    constexpr double FS_TO_MD_TIME = 1.0 / MD_TIME_UNIT_FS; // 0.5123963
 }
 
 // ===== UNIT CONVERSION FUNCTIONS =====
