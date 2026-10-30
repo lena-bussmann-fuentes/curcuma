@@ -324,7 +324,7 @@ bool NebMD::Initialise()
     return true;
 }
 
-void NebMD::resetPmfAccumulators(int nat)
+void NebMD::resetPmfAccumulators(int /*nat*/)
 {
     // Claude Generated 2026: single place where every PMF running sum is (re)initialised.
     // Previously duplicated in two call sites, which is how a new accumulator gets
@@ -3242,7 +3242,7 @@ Geometry NebMD::pathBiasField(const Geometry& R, double* Z_out) const
     return b;
 }
 
-void NebMD::accumulateMeanForce(int i, SimpleMD* img, FeLocal& out, std::mt19937& rng) const
+void NebMD::accumulateMeanForce(int /*i*/, SimpleMD* img, FeLocal& out, std::mt19937& rng) const
 {
     // Claude Generated 2026: conditional mean force for the decoupled scheme.
     //
