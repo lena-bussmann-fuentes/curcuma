@@ -562,6 +562,9 @@ private:
     /*! \brief Claude Generated (Sep 2026): run one integration step, with optional step
      *  rejection (adaptive_step). Without it this is a plain call to Integrator(). */
     void IntegratorStep();
+#ifdef USE_Plumed
+    void performPlumedCalc(); ///< run PLUMED with the force sign it expects (see simplemd.cpp)
+#endif
     /*! \brief Claude Generated (Sep 2026): step-rejection tolerance in Hartree, derived from
      *  adaptive_step_tol and the system's thermal energy. */
     double adaptiveStepTolerance() const;

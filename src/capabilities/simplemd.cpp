@@ -2253,7 +2253,10 @@ void SimpleMD::prepareRun()
         plumed_cmd(m_plumedmain, "setMDMassUnits", &massUnits); // Pass a pointer to the conversion factor between the mass unit used in your code and amu
         plumed_cmd(m_plumedmain, "setMDChargeUnits", &chargeUnit);
         plumed_cmd(m_plumedmain, "setTimestep", &m_dT); // Pass a pointer to the molecular dynamics timestep to plumed                       // Pass the name of your md engine to plumed (now it is just a label)
-        plumed_cmd(m_plumedmain, "setKbT", &kb_Eh);
+        // Claude Generated (Oct 2026): PLUMED expects kB*T in MD energy units, not kB; with kB alone
+        // every action that takes its temperature from the engine (METAD without TEMP) saw T = 1 K.
+        double kbt = kb_Eh * m_T0;
+        plumed_cmd(m_plumedmain, "setKbT", &kbt);
         // Claude Generated 2026: Route PLUMED log into BMT/plumed-files subdirectory
         std::string plumed_log_path = plumedPath("plumed_log.out");
         plumed_cmd(m_plumedmain, "setLogFile", plumed_log_path.c_str()); // Pass the file on which to write out the plumed log
@@ -2288,8 +2291,7 @@ void SimpleMD::prepareRun()
         plumed_cmd(m_plumedmain, "setForces", &m_eigen_gradient.data()[0]);
         plumed_cmd(m_plumedmain, "setVirial", &m_virial[0]);
         plumed_cmd(m_plumedmain, "setMasses", &m_eigen_masses.data()[0]);
-        plumed_cmd(m_plumedmain, "prepareCalc", NULL);
-        plumed_cmd(m_plumedmain, "performCalc", NULL);
+        performPlumedCalc();
     }
 #endif
     std::vector<double> charge(0, m_natoms);
@@ -3963,8 +3965,7 @@ void SimpleMD::Verlet()
 
         plumed_cmd(m_plumedmain, "setMasses", &m_eigen_masses.data()[0]);
         if (m_eval_mtd) {
-            plumed_cmd(m_plumedmain, "prepareCalc", NULL);
-            plumed_cmd(m_plumedmain, "performCalc", NULL);
+            performPlumedCalc();
         } else {
             if (std::abs(m_T0 - m_aver_Temp) < m_mtd_dT && m_step > 10) {
                 m_eval_mtd = true;
@@ -4303,8 +4304,7 @@ void SimpleMD::Rattle()
 
         plumed_cmd(m_plumedmain, "setMasses", &m_eigen_masses.data()[0]);
         if (m_eval_mtd) {
-            plumed_cmd(m_plumedmain, "prepareCalc", NULL);
-            plumed_cmd(m_plumedmain, "performCalc", NULL);
+            performPlumedCalc();
         } else {
             if (std::abs(m_T0 - m_aver_Temp) < m_mtd_dT && m_step > 10) {
                 m_eval_mtd = true;
@@ -5674,6 +5674,20 @@ void SimpleMD::Berendson()
         m_eigen_velocities.data()[3 * i + 2] *= lambda;
     }
 }
+
+#ifdef USE_Plumed
+/* Claude Generated (Oct 2026): PLUMED ADDS its bias force to the array given to setForces, but
+ * curcuma hands it the gradient, and the integrator moves along -gradient. Without the sign
+ * change the bias acts with the wrong sign: a RESTRAINT repels (distance grows as cosh(w t))
+ * and METAD hills attract, so the system is pinned where it already is. */
+void SimpleMD::performPlumedCalc()
+{
+    m_eigen_gradient *= -1.0;
+    plumed_cmd(m_plumedmain, "prepareCalc", NULL);
+    plumed_cmd(m_plumedmain, "performCalc", NULL);
+    m_eigen_gradient *= -1.0;
+}
+#endif
 
 void SimpleMD::CSVR()
 {

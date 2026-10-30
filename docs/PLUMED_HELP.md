@@ -3,6 +3,20 @@
 Enhanced-sampling MD via the PLUMED2 plugin.
 Requires building with `-DUSE_Plumed=ON` (off by default).
 
+> **All PLUMED biases before the fix of Oct 30, 2026 acted with the wrong sign.** PLUMED adds its
+> force to the array passed to `setForces`, curcuma passed the gradient, so a `RESTRAINT` repelled
+> and `METAD` hills attracted. Results of earlier PLUMED runs with a bias are invalid; plain
+> `PRINT` of a CV was unaffected. PLUMED also received kB instead of kB*T, i.e. T = 1 K for every
+> action without its own `TEMP`.
+
+**Status of the fix** (AI-generated, machine-tested; human production testing pending).
+Tested: test `plumed_bias` (Ar2 `RESTRAINT`, period 0.3971 ps = analytic 0.3971 ps; fails on the
+old code with 4e18 nm); ethane torsion, GFN-FF, 300 K: `METAD` 10 ps, 96-112 basin changes (old code
+0, torsion pinned to 0.81-1.21 rad); well-tempered `METAD` without `TEMP`, 4 x 1 ns, barrier
+2.66 kcal/mol (run range 2.52-2.83) against 2.43 from the histogram of 8 x 1 ns free MD
+(run range 2.25-2.57), i.e. about 10 % high with non-converged hills.
+Not tested: other systems and CVs, QM methods, restarts, `setVirial`/NPT, GPU together with PLUMED.
+
 ## CLI flags
 
 | Flag | Type | Default | Description |

@@ -112,6 +112,13 @@ if(USE_Plumed)
     endif()
     add_test(NAME test_plumed_init COMMAND test_plumed_init)
     set_tests_properties(test_plumed_init PROPERTIES TIMEOUT 10 LABELS "plumed;unit")
+    # Claude Generated (Oct 2026): real PLUMED run, a RESTRAINT must oscillate with the analytic period.
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME plumed_bias
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_plumed_bias.py $<TARGET_FILE:curcuma>)
+        set_tests_properties(plumed_bias PROPERTIES TIMEOUT 300 LABELS "plumed;md;units")
+    endif()
 endif()
 
 # Claude Generated: CG Potentials unit test suite
