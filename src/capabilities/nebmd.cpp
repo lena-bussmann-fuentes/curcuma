@@ -1209,6 +1209,9 @@ bool NebMD::prepareImages()
     if (m_string)
         sd["max_time"] = m_string_max_time;
     sd["mtd"] = false;
+    // Claude Generated (Oct 2026): print_frequency below suppresses the per-image status lines,
+    // so every image would only leave a header-only <image>.md.csv in the BMT dir.
+    sd["write_csv"] = false;
     sd["wall_type"] = "none";
     sd["unique"] = false;
     sd["threads"] = m_threads;
