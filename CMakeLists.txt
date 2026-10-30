@@ -497,8 +497,6 @@ set(curcuma_core_SRC
         src/capabilities/persistentdiagram.cpp
         src/capabilities/analysenciplot.cpp
         src/capabilities/curcumamethod.cpp
-        # Native LBFGS optimizer - Claude Generated (disabled, superseded by native_optimizer_adapters)
-        # src/capabilities/native_lbfgs_optimizer.cpp
         src/capabilities/confscan.cpp
         src/capabilities/confsearch.cpp
         src/capabilities/shared_bias_pool.cpp
@@ -512,7 +510,13 @@ set(curcuma_core_SRC
         src/capabilities/rmsd/rmsd_costmatrix.cpp
         src/capabilities/rmsd/rmsd_assignment.cpp
         src/capabilities/rmsdtraj.cpp
+        src/capabilities/external_potentials.cpp
+        src/capabilities/measurement.cpp
+        src/tools/cif.cpp
         src/capabilities/simplemd.cpp
+        src/capabilities/nebmd.cpp
+        src/capabilities/path_cv.cpp
+        src/capabilities/string_path.cpp
         src/capabilities/md_diagnostics.cpp
         src/capabilities/analysis.cpp
         src/capabilities/analysis_output.cpp
@@ -537,6 +541,7 @@ set(curcuma_core_SRC
         src/core/energy_calculators/qm_methods/xtb_scf.cpp
         src/core/energy_calculators/qm_methods/xtb_fragment_scf.cpp
         src/core/energy_calculators/qm_methods/xtb_dc.cpp
+        src/core/energy_calculators/qm_methods/xtb_precond.cpp
         src/core/energy_calculators/qm_methods/xtb_sparse.cpp
         src/core/energy_calculators/qm_methods/native_eigensolver.cpp
         src/core/energy_calculators/qm_methods/xtb_multipole.cpp
@@ -626,7 +631,13 @@ set(curcuma_cap_SRC
         src/capabilities/rmsd/rmsd_costmatrix.cpp
         src/capabilities/rmsd/rmsd_assignment.cpp
         src/capabilities/rmsdtraj.cpp
+        src/capabilities/external_potentials.cpp
+        src/capabilities/measurement.cpp
+        src/tools/cif.cpp
         src/capabilities/simplemd.cpp
+        src/capabilities/nebmd.cpp
+        src/capabilities/path_cv.cpp
+        src/capabilities/string_path.cpp
         src/capabilities/md_diagnostics.cpp
         src/capabilities/analysis.cpp
         src/capabilities/analysis_output.cpp
@@ -1544,10 +1555,6 @@ endif()
 add_executable(curcuma_helper
         src/helpers/main.cpp)
         
-# cli_helper disabled - requires cli_parser.h (native-gfnff WIP)
-# add_executable(cli_helper
-#         src/helpers/cli_test.cpp)
-
 add_executable(parallel_scf
         src/helpers/parallel_scf.cpp)
 target_link_libraries(parallel_scf curcuma_core)
@@ -1580,13 +1587,13 @@ target_sources(Continuous
 )
 add_test(NAME molecule_comprehensive COMMAND test_molecule)
 
-add_test(NAME AAAbGal_dtemplate COMMAND AAAbGal dtemplate WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
-add_test(NAME AAAbGal_free COMMAND AAAbGal free WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
-add_test(NAME AAAbGal_template COMMAND AAAbGal template WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
-add_test(NAME AAAbGal_subspace COMMAND AAAbGal subspace WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
-#add_test(NAME AAAbGal_incremental COMMAND AAAbGal incr WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
+add_test(NAME AAAbGlc_dtemplate COMMAND AAAbGlc dtemplate WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
+add_test(NAME AAAbGlc_free COMMAND AAAbGlc free WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
+add_test(NAME AAAbGlc_template COMMAND AAAbGlc template WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
+add_test(NAME AAAbGlc_subspace COMMAND AAAbGlc subspace WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
+#add_test(NAME AAAbGlc_incremental COMMAND AAAbGlc incr WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
 
-#set_tests_properties(AAAbGal_incremental PROPERTIES TIMEOUT 300)
+#set_tests_properties(AAAbGlc_incremental PROPERTIES TIMEOUT 300)
 
 add_test(NAME confscan_subspace COMMAND confscan_test subspace WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
 add_test(NAME confscan_free COMMAND confscan_test free WORKING_DIRECTORY ${PROJECT_BINARY_DIR}/test_cases)
@@ -1615,7 +1622,7 @@ add_test(NAME energy_methods COMMAND test_energy_methods WORKING_DIRECTORY ${PRO
 # Claude Generated: Parameter I/O system comprehensive tests (October 2025)
 add_test(
     NAME parameter_io_tests
-    COMMAND bash ${CMAKE_SOURCE_DIR}/test_cases/test_parameter_io.sh
+    COMMAND bash ${CMAKE_SOURCE_DIR}/test_cases/scripts/test_parameter_io.sh
     WORKING_DIRECTORY ${PROJECT_BINARY_DIR}
 )
 
@@ -1623,6 +1630,21 @@ add_test(
 
 # 1. Define the parser executable
 add_executable(curcuma_param_parser scripts/param_parser/main.cpp)
+
+# Claude Generated (Oct 26, 2026): the parser runs during the build (GenerateParams) on the machine that builds, so it must run on any
+# x86-64 CPU. It needs no vector code, but it inherits CMAKE_CXX_FLAGS (-march=native, -mavx2, -mavx512f ... above): an AVX512 build on a
+# CI runner without AVX512 would die with "illegal instruction" when the parser starts. Give this target the baseline instruction set;
+# target options come after CMAKE_CXX_FLAGS, so they win. Only flags the compiler knows are added (no effect on MSVC or ARM).
+if(NOT MSVC)
+    include(CheckCXXCompilerFlag)
+    foreach(_flag -march=x86-64 -mtune=generic -mno-avx512f -mno-avx512vl -mno-avx512dq -mno-avx512bw -mno-avx2 -mno-avx -mno-fma)
+        string(MAKE_C_IDENTIFIER "CURCUMA_PP_${_flag}" _var)
+        check_cxx_compiler_flag("${_flag}" ${_var})
+        if(${_var})
+            target_compile_options(curcuma_param_parser PRIVATE ${_flag})
+        endif()
+    endforeach()
+endif()
 
 # 2. Get all header files in the project
 file(GLOB_RECURSE ALL_PROJECT_HEADERS "src/*.h" "src/**/*.h")

@@ -29,7 +29,9 @@
 #pragma once
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <limits>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -87,6 +89,48 @@ struct GFNFFDispersion {
     double r0_squared = 0.0;    ///< Pre-computed R0^2 = (a1*sqrt(r4r2ij) + a2)^2
     double r_cut = 50.0;        ///< Cutoff radius (Bohr)
     double zetac6 = 1.0;        ///< Zeta charge scaling
+};
+
+/**
+ * @brief dC6/dCN of the D4 pair list, one entry per pair (Claude Generated, Oct 2026).
+ *
+ * Replaces the dense N x N matrix dc6dcn(i,j) = dC6(i,j)/dCN(i), of which only the cells of
+ * the pair list were ever filled (429 MB at 7320 atoms, zeroed every gradient step).
+ * pairs[p] = (i, j) with i < j, strictly sorted (i, then j) - the order in which
+ * D4ParameterGenerator::GenerateDispersionPairsNative() emits them. dc6_di[p] is the former
+ * cell (i, j) = dC6(i,j)/dCN(i), dc6_dj[p] the former cell (j, i) = dC6(i,j)/dCN(j).
+ * Reference: Fortran gfnff_gdisp0.f90:262-305 (dc6dcn), 382-395 (its use in the gradient).
+ */
+struct D4DC6DCNPairs {
+    std::vector<std::pair<int, int>> pairs;  ///< (i, j), i < j, sorted
+    std::vector<double> dc6_di;              ///< dC6(i,j)/dCN(i), aligned with pairs
+    std::vector<double> dc6_dj;              ///< dC6(i,j)/dCN(j), aligned with pairs
+
+    /**
+     * @brief The two former matrix cells (a, b) and (b, a) for the pair {a, b}.
+     * @param hint  index tried first (a caller walking a list in pair-list order passes the
+     *              value the previous call left, so the lookup is O(1)); else binary search.
+     * @return false if {a, b} is not in the list (the matrix cells were 0 then).
+     */
+    bool lookup(int a, int b, std::size_t& hint, double& d_a, double& d_b) const
+    {
+        const std::size_t n = pairs.size();
+        if (n == 0 || a == b || dc6_di.size() != n || dc6_dj.size() != n)
+            return false;
+        const bool swapped = a > b;
+        const std::pair<int, int> key = swapped ? std::make_pair(b, a) : std::make_pair(a, b);
+        std::size_t p = hint;
+        if (p >= n || pairs[p] != key) {
+            auto it = std::lower_bound(pairs.begin(), pairs.end(), key);
+            if (it == pairs.end() || *it != key)
+                return false;
+            p = static_cast<std::size_t>(it - pairs.begin());
+        }
+        hint = p + 1;
+        d_a = swapped ? dc6_dj[p] : dc6_di[p];
+        d_b = swapped ? dc6_di[p] : dc6_dj[p];
+        return true;
+    }
 };
 
 /**
@@ -168,6 +212,24 @@ struct GFNFFHydrogenBond {
 
     mutable double strength = 1.0;
     double sigmoid_width = 0.5;
+};
+
+/**
+ * @brief Per-atom inputs of the H-bond detection in flat arrays (Claude Generated, Oct 2026)
+ *
+ * Filled by GFNFF::prepareHBDetectInputs() (the O(N) part of detectHydrogenBondsNative()), consumed by the
+ * device-side detection (FFWorkspaceGPU::detectHBondsOnDevice(), -gfnff.gpu_hb_detect_on_device).
+ */
+struct GFNFFHBDetectInputs {
+    int natoms = 0;
+    std::vector<double> basicity, acidity, charge;  ///< current_basicity / current_acidity / Phase-1 charge
+    std::vector<char> is_hb_hyd, ab_ok;             ///< HB-capable hydrogen / atom may be donor or acceptor
+    std::vector<int> hb_hyd_list;                   ///< the HB hydrogens, ascending
+    std::vector<int> nbr_off, nbr_idx;              ///< topology neighbour lists (neighbors_B / neighbors_C source)
+    std::vector<int> bond_off, bond_idx;            ///< bonded partners of each atom (is_bonded)
+    std::vector<int> hyd_off, hyd_idx;              ///< HB hydrogens bonded to each atom (hyd_on)
+    double hbthr1 = 0.0, hbthr2 = 0.0;              ///< squared-Bohr thresholds of the AB pair and the case-1 criterion
+    double min_pair_energy = 0.0;                   ///< hb_min_pair_energy_eh (case-1 pruning, 0 = off)
 };
 
 /**

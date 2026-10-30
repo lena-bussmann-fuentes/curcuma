@@ -48,6 +48,7 @@
 #include "src/capabilities/rmsd.h"
 #include "src/capabilities/rmsdtraj.h"
 #include "src/capabilities/simplemd.h"
+#include "src/capabilities/nebmd.h"  // Claude Generated 2026: NEB-like molecular dynamics
 #include "src/capabilities/trajectory_statistics.h"
 #include "src/capabilities/trajectoryanalysis.h"
 #include "src/capabilities/polymerbuild.h"
@@ -686,8 +687,7 @@ json CLI2Json(int argc, char** argv)
     // both at top level (controller[param]) and module level (controller[module][param])
     // ENHANCED: Added "method" to support global energy method specification
     // Claude Generated (March 2026): Added "gpu" for GPU acceleration control.
-    //   -gpu <backend>: none (default, CPU) | cuda | rocm | vulkan | auto.
-    //   "auto" picks the first compiled GPU backend (cuda > rocm > vulkan), else CPU.
+    //   -gpu <backend>: none (default, CPU) | cuda | rocm | vulkan. ("auto" was removed Oct 26, 2026: warning, CPU.)
     //   Applies to gfn1/gfn2 (USE_*_XTB builds) and gfnff (USE_* builds); an explicit
     //   backend not compiled in warns and falls back to CPU.
     // Claude Generated (Jul 2026): Added "charge","spin" — molecular charge/spin must reach
@@ -734,7 +734,8 @@ json CLI2Json(int argc, char** argv)
         {"rmsd", "rmsd"},
         {"analysis", "analysis"},
         {"hessian", "hessian"},
-        {"casino", "casino"}
+        {"casino", "casino"},
+        {"nebmd", "nebmd"}  // Claude Generated 2026: NEB-like molecular dynamics
     };
 
     // Get actual module name (for ConfigManager)
@@ -763,6 +764,16 @@ json CLI2Json(int argc, char** argv)
         std::string sub = current.substr(0, 1);
 
         if (sub == "-") {
+            // Claude Generated (Oct 2026): a flag token that contains whitespace ("-spin 1" as ONE
+            // argv entry, e.g. from a shell variable that was not word-split) used to become the
+            // boolean key "spin 1" and was silently ignored - the run then reported a closed-shell
+            // energy for a radical. No parameter name contains whitespace, so refuse it.
+            if (current.find_first_of(" \t\r\n") != std::string::npos) {
+                CurcumaLogger::error("Command-line argument '" + current
+                    + "' contains whitespace: flag and value must be separate arguments "
+                      "(check shell quoting / variable expansion).");
+                exit(1);
+            }
             current.erase(0, 1);
             // Claude Generated (Jun 2026): canonicalize hyphens to underscores in CLI
             // parameter names so "-opt-method" matches the JSON key "opt_method".
@@ -950,6 +961,28 @@ json CLI2Json(int argc, char** argv)
             }
             if (matches_current)
                 continue;
+
+            // Claude Generated (Oct 16, 2026): a name several modules register (-electronic_temperature:
+            // tblite, ulysses, xtb) is routed to the module of the selected -method when that module is
+            // one of the owners. Before, it stayed in the command module with a warning and no method
+            // ever read it (-electronic_temperature 40000 did not change a native gfn2 energy).
+            if (owners.size() > 1 && key.contains("method") && key["method"].is_string()) {
+                std::string method_scope = MethodFactory::parameterScopeForMethod(key["method"].get<std::string>());
+                // Oct 2026: a shared SCF knob (-max_iterations, -diis_start: module "scf" via aliases, and others)
+                // goes to "scf" when the method's own scope does not register it but the method reads "scf".
+                if (std::find(owners.begin(), owners.end(), method_scope) == owners.end()
+                    && std::find(owners.begin(), owners.end(), std::string("scf")) != owners.end()
+                    && MethodFactory::readsSharedScfScope(key["method"].get<std::string>()))
+                    method_scope = "scf";
+                if (!method_scope.empty()
+                    && std::find(owners.begin(), owners.end(), method_scope) != owners.end()) {
+                    CurcumaLogger::info("CLI flag -" + pname + " is registered in several modules; routed to -"
+                        + method_scope + "." + pname + " for the selected method \"" + key["method"].get<std::string>() + "\".");
+                    reroute_targets[method_scope][pname] = it.value();
+                    reroute_remove.push_back(pname);
+                    continue;
+                }
+            }
 
             if (owners.size() > 1) {
                 std::string candidates;
@@ -1685,21 +1718,9 @@ int executeRMSD(const json& controller, int argc, char** argv) {
 
     // Write RMSD results as JSON
     {
-        json rmsd_result;
-        rmsd_result["rmsd"] = driver->RMSD();
-        rmsd_result["rmsd_raw"] = driver->RMSDRaw();
-
-        // Permutation vector: identity if no reordering was performed
-        std::vector<int> permutation = driver->ReorderRules();
-        if (permutation.empty()) {
-            permutation.resize(driver->ReferenceAligned().AtomCount());
-            std::iota(permutation.begin(), permutation.end(), 0);
-        }
-        rmsd_result["permutation"] = permutation;
-        rmsd_result["reference_xyz"] = driver->ReferenceAligned().XYZString();
-        // Geometry whose deviation equals RMSD() (reordered+aligned, or plain best-fit when
-        // no reorder ran). Same result as the old TargetReorderd()/TargetAligned() fallback.
-        rmsd_result["reorder_xyz"] = driver->TargetForRMSD().XYZString();
+        // Claude Generated 2026 - The document now comes from the driver; the file
+        // names are the only part the CLI knows and the driver does not.
+        json rmsd_result = driver->Results();
         rmsd_result["reference_file"] = reffile;
         rmsd_result["target_file"] = tarfile;
 
@@ -2276,11 +2297,184 @@ int executeSimpleMD(const json& controller, int argc, char** argv) {
     auto* md = new SimpleMD(md_controller, false);
     initializeBMT(md, argv[2], "md", controller);
     md->setMolecule(mol);
-    md->Initialise();
+    // Claude Generated (Oct 2026): a failed setup (unknown method, unsupported EEQ solver for the
+    // device, ...) used to print the error and still end with exit code 0, which scripts read as
+    // success. Initialise() already returns false with the reason logged.
+    if (!md->Initialise()) {
+        CurcumaLogger::error("MD setup failed - no simulation was run");
+        delete md;
+        return 1;
+    }
     md->start();
     md->processBakFiles();
     delete md;
     return 0;
+}
+
+/*! \brief Two-stage NEB-MD chain: finite-temperature string -> path-CV conditional mean force.
+ *
+ *  Claude Generated 2026 (AI-generated, machine-tested). Stage 1 runs scheme 'string' for
+ *  string_max_time and writes <base>.neb.string.xyz (consecutively Kabsch-aligned, atom order
+ *  of start.xyz). Stage 2 reads it as path_file and runs scheme 'independent' with umbrella and
+ *  (unless the user set -nebmd.constrain) the holonomic constraint on s, in the SAME BMT
+ *  directory under the basename <base>.stage2. The stage-2 path is used as written: optimize,
+ *  idpp and repair_overlaps would otherwise modify the frames read from path_file.
+ *  \param ctrl        resolved controller (simplemd merge already done by executeNebMD)
+ *  \param controller  original controller (BMT / -bak handling)
+ *  \return 0 on success, 1 when stage 1 aborted (dead image) or produced no path. */
+static int executeNebMDPipeline(const json& ctrl, const json& controller, const Molecule& start,
+                                const Molecule& end, const std::string& startfile)
+{
+    ConfigManager cfg("nebmd", ctrl);
+
+    json ctrl1 = ctrl;
+    if (!ctrl1.contains("nebmd") || !ctrl1["nebmd"].is_object())
+        ctrl1["nebmd"] = json::object();
+    if (!ctrl1.contains("simplemd") || !ctrl1["simplemd"].is_object())
+        ctrl1["simplemd"] = json::object();
+    ctrl1["nebmd"]["scheme"] = "string";
+    ctrl1["nebmd"]["umbrella"] = false;  // stage-2 settings must not leak into stage 1
+    ctrl1["nebmd"]["constrain"] = false;
+    ctrl1["nebmd"]["pipeline"] = false;
+    ctrl1["simplemd"]["max_time"] = cfg.get<double>("string_max_time");
+
+    CurcumaLogger::result("NEB-MD pipeline: stage 1 - finite-temperature string");
+    auto* neb1 = new NebMD(ctrl1, false);
+    initializeBMT(neb1, startfile, "nebmd", controller);
+    neb1->setEndpoints(start, end);
+    neb1->Initialise();
+    neb1->start();
+    // Claude Generated 2026: stage 1 aborted (dead image, string_abort_on_dead) -> its path is
+    // not relaxed; never continue with it.
+    if (neb1->failed()) {
+        CurcumaLogger::error("NEB-MD pipeline: stage 1 (string) aborted - stage 2 skipped.");
+        neb1->processBakFiles();
+        delete neb1;
+        return 1;
+    }
+    const std::string path = neb1->outputPath(neb1->Basename() + ".neb.string.xyz");
+    if (!std::ifstream(path).good()) {
+        CurcumaLogger::error("NEB-MD pipeline: stage 1 wrote no string path (" + path + ") - stage 2 skipped.");
+        neb1->processBakFiles();
+        delete neb1;
+        return 1;
+    }
+
+    json ctrl2 = ctrl;
+    if (!ctrl2.contains("nebmd") || !ctrl2["nebmd"].is_object())
+        ctrl2["nebmd"] = json::object();
+    const bool user_constrain = ctrl2["nebmd"].contains("constrain");
+    ctrl2["nebmd"]["path_file"] = path;
+    ctrl2["nebmd"]["scheme"] = "independent";
+    ctrl2["nebmd"]["umbrella"] = true;
+    if (!user_constrain)
+        ctrl2["nebmd"]["constrain"] = true;
+    ctrl2["nebmd"]["optimize"] = false;        // the path is the stage-1 result, use as written
+    ctrl2["nebmd"]["idpp"] = false;
+    ctrl2["nebmd"]["repair_overlaps"] = false;
+    ctrl2["nebmd"]["pipeline"] = false;
+
+    CurcumaLogger::result("NEB-MD pipeline: stage 2 - conditional mean force on the path CV of " + path);
+    auto* neb2 = new NebMD(ctrl2, false);
+    neb2->setFile(startfile);
+    neb2->setOutputDir(neb1->OutputDir());
+    neb2->overrideBasename(neb1->Basename() + ".stage2");
+    neb2->setEndpoints(start, end);
+    neb2->Initialise();
+    neb2->start();
+    // neb2 has no BMT directory of its own (it only borrows the output dir), so its copy-back
+    // is done through neb1: register every stage-2 output that exists.
+    for (const char* suffix : { ".neb.path.xyz", ".neb.energy.csv", ".neb.final.xyz", ".neb.init.xyz",
+             ".neb.fe.csv", ".neb.wham.csv" }) {
+        const std::string name = neb2->Basename() + suffix;
+        if (std::ifstream(neb1->outputPath(name)).good())
+            neb1->addBakFile(name);
+    }
+    neb1->processBakFiles();
+    delete neb2;
+    delete neb1;
+    return 0;
+}
+
+// Claude Generated 2026: NEB-like molecular dynamics handler.
+int executeNebMD(const json& controller, int argc, char** argv) {
+    if (argc < 4) {
+        std::cerr << "Please use curcuma for NEB-MD as follows:\n"
+                  << "  curcuma -nebmd start.xyz end.xyz -nebmd.nimages 12 -method uff ..." << std::endl;
+        NebMD help(json::object(), true);
+        help.printHelp();
+        return 0;
+    }
+    Molecule start = Files::LoadFile(argv[2]);
+    Molecule end = Files::LoadFile(argv[3]);
+    if (start.AtomCount() == 0) {
+        CurcumaLogger::error_fmt("Could not load start structure from file: {}", argv[2]);
+        return 1;
+    }
+    if (end.AtomCount() == 0) {
+        CurcumaLogger::error_fmt("Could not load end structure from file: {}", argv[3]);
+        return 1;
+    }
+
+    // Claude Generated (Oct 2026): apply total charge/spin from the CLI (-charge, -spin) to both
+    // endpoints. Without this every NEB-MD calculator was built at charge 0 (an anionic SN2 test
+    // evaluated the endpoints as neutral); same convention as -sp/-opt.
+    if (controller.contains("charge")) {
+        start.setCharge(controller["charge"].get<int>());
+        end.setCharge(controller["charge"].get<int>());
+    }
+    if (controller.contains("spin")) {
+        start.setSpin(controller["spin"].get<int>());
+        end.setSpin(controller["spin"].get<int>());
+    }
+
+    json ctrl = controller;
+    ctrl["geometry_file"] = std::string(argv[2]);
+
+    // Claude Generated 2026: Forward MD parameters supplied as -md.* (which land in
+    // controller["md"]) and ambiguous bare flags like -temperature (multi-owner
+    // casino+simplemd, kept in the command module) into controller["simplemd"] so
+    // the per-image SimpleMD instances receive them. -simplemd.* wins on conflict.
+    // This makes -md.*, bare -time_step/-max_time/-thermostat/-temperature and
+    // -simplemd.* all work for -nebmd (bare single-owner flags already auto-route).
+    auto ensure_simplemd = [&ctrl]() {
+        if (!ctrl.contains("simplemd") || !ctrl["simplemd"].is_object())
+            ctrl["simplemd"] = json::object();
+    };
+    auto merge_from = [&ctrl, &ensure_simplemd](const std::string& src) {
+        if (!ctrl.contains(src) || !ctrl[src].is_object()) return;
+        ensure_simplemd();
+        for (auto& [k, v] : ctrl[src].items())
+            if (!ctrl["simplemd"].contains(k)) ctrl["simplemd"][k] = v;
+    };
+    merge_from("md"); // -md.* -> controller["md"]
+    // Move ambiguous bare MD flags that the flat-router left in the command module
+    // (controller["nebmd"]) because they are multi-owner and none matched "nebmd".
+    if (ctrl.contains("nebmd") && ctrl["nebmd"].is_object()) {
+        ensure_simplemd();
+        for (auto& [k, v] : ctrl["nebmd"].items()) {
+            if (v.is_object() || ctrl["simplemd"].contains(k)) continue;
+            const auto owners = ParameterRegistry::getInstance().findOwnerModules(k);
+            for (const auto& o : owners)
+                if (o == "simplemd") { ctrl["simplemd"][k] = v; break; }
+        }
+    }
+
+    // Claude Generated 2026: two-stage chain string -> path-CV mean force (-nebmd.pipeline).
+    // Lives here because the BMT directory is created here; stage 2 writes into the stage-1
+    // directory under the basename <base>.stage2.
+    if (ConfigManager("nebmd", ctrl).get<bool>("pipeline"))
+        return executeNebMDPipeline(ctrl, controller, start, end, argv[2]);
+
+    auto* neb = new NebMD(ctrl, false);
+    initializeBMT(neb, argv[2], "nebmd", controller);
+    neb->setEndpoints(start, end);
+    neb->Initialise();
+    neb->start();
+    neb->processBakFiles();
+    const int rc = neb->failed() ? 1 : 0; // Claude Generated 2026: aborted string stage -> exit != 0
+    delete neb;
+    return rc;
 }
 
 int executeCasino(const json& controller, int argc, char** argv) {
@@ -2646,6 +2840,8 @@ const std::map<std::string, CapabilityInfo> CAPABILITY_REGISTRY = {
                   {"XYZ.trj", "VTF"}, executeRMSDTraj}},
     {"nebprep", {"Nudged Elastic Band (NEB) geometry preparation", "conformational",
                  {"XYZ"}, executeNEBPrep}},
+    {"nebmd", {"NEB-like molecular dynamics: independently-thermostatted replicas coupled by springs along a reaction path", "dynamics",
+               {"XYZ"}, executeNebMD}},
     {"centroid", {"Calculate centroid of atom fragments", "analysis",
                   {"XYZ", "MOL2", "SDF"}, executeCentroid}},
     {"split", {"Split supramolecular structures into fragments", "analysis",

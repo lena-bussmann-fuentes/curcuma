@@ -286,7 +286,8 @@ static const std::map<std::string, WallGeometry> wall_geometry_map = {
 
 static const std::map<std::string, WallPotentialType> wall_potential_map = {
     {"logfermi", WallPotentialType::LogFermi},
-    {"harmonic", WallPotentialType::Harmonic}
+    {"harmonic", WallPotentialType::Harmonic},
+    {"pbc", WallPotentialType::Periodic}
 };
 
 void SimpleMD::LoadControlJson()
@@ -410,6 +411,7 @@ void SimpleMD::LoadControlJson()
     m_global_ramp.enabled = m_temp_ramp
         && ParseSchedule(m_config.get<std::string>("temp_schedule"), m_global_ramp.schedule, "temp_schedule");
     ParseThermalRegions();
+    ParseExternalPotentials();
 
     // Claude Generated 2025: Output & Restart Parameters
     m_writerestart = m_config.get<int>("write_restart_frequency");
@@ -441,6 +443,12 @@ void SimpleMD::LoadControlJson()
     } else {
         m_cg_timestep_factor = cg_timestep_factor_config;
     }
+
+    // Claude Generated 2026: umbrella restraint on q = d(i,j) - d(i,k), parsed in Initialise()
+    m_umbrella_q_spec = m_config.get<std::string>("umbrella_q");
+    m_umbrella_q_frequency = std::max(1, m_config.get<int>("umbrella_q_frequency"));
+    m_umbrella_cv_spec = m_config.get<std::string>("umbrella_cv"); // Claude Generated 2026
+    m_umbrella_cv_frequency = std::max(1, m_config.get<int>("umbrella_cv_frequency"));
 
     // WP-S2 (May 2026): per-step diagnostics JSONL dump
     m_md_diagnostics = m_config.get<bool>("md_diagnostics");
@@ -475,11 +483,11 @@ void SimpleMD::LoadControlJson()
         // m_coupling = m_dT;
         m_rattle = m_config.get<int>("rattle");
         if (m_verbosity >= 1) {
-            std::cout << "Using rattle to constrain bonds!" << std::endl;
+            CurcumaLogger::raw("Using rattle to constrain bonds!");
             if (m_rattle_12)
-                std::cout << "Using rattle to constrain 1,2 distances!" << std::endl;
+                CurcumaLogger::raw("Using rattle to constrain 1,2 distances!");
             if (m_rattle_13)
-                std::cout << "Using rattle to constrain 1,3 distances between two bonds!" << std::endl;
+                CurcumaLogger::raw("Using rattle to constrain 1,3 distances between two bonds!");
         }
 
     } else {
@@ -494,13 +502,13 @@ void SimpleMD::LoadControlJson()
             return this->CleanEnergy();
         };
         if (m_verbosity >= 1)
-            std::cout << "Energy Calculator will be set up for each step! Single steps are slower, but more reliable. Recommended for the combination of GFN2 and solvation." << std::endl;
+            CurcumaLogger::raw("Energy Calculator will be set up for each step! Single steps are slower, but more reliable. Recommended for the combination of GFN2 and solvation.");
     } else {
         Energy = [=]() -> double {
             return this->FastEnergy();
         };
         if (m_verbosity >= 1)
-            std::cout << "Energy Calculator will NOT be set up for each step! Fast energy calculation! This is the default way and should not be changed unless the energy and gradient calculation are unstable (happens with GFN2 and solvation)." << std::endl;
+            CurcumaLogger::raw("Energy Calculator will NOT be set up for each step! Fast energy calculation! This is the default way and should not be changed unless the energy and gradient calculation are unstable (happens with GFN2 and solvation).");
     }
 
     // Claude Generated 2025: Wall Potential Parameters - Enum-based selection
@@ -529,9 +537,17 @@ void SimpleMD::LoadControlJson()
                     return m_wall_potential;
                 };
                 break;
+            case WallPotentialType::Periodic:
+                // No potential: wrapIntoContainer() relocates escaping molecules
+                // after the integration step instead of pushing them back.
+                m_wall_type = 1;
+                m_wall_wrap = true;
+                WallPotential = [=]() -> double { return 0.0; };
+                break;
         }
         if (m_verbosity >= 1)
-            std::cout << "Setting up spherical potential" << std::endl;
+            CurcumaLogger::raw(m_wall_wrap ? "Setting up spherical periodic container"
+                                           : "Setting up spherical potential");
 
     } else if (wall_geom == WallGeometry::Rect) {
         switch (wall_pot) {
@@ -549,9 +565,15 @@ void SimpleMD::LoadControlJson()
                     return m_wall_potential;
                 };
                 break;
+            case WallPotentialType::Periodic:
+                m_wall_type = 2;
+                m_wall_wrap = true;
+                WallPotential = [=]() -> double { return 0.0; };
+                break;
         }
         if (m_verbosity >= 1)
-            std::cout << "Setting up rectangular potential" << std::endl;
+            CurcumaLogger::raw(m_wall_wrap ? "Setting up rectangular periodic container"
+                               : "Setting up rectangular potential");
     } else {
         WallPotential = [=]() -> double {
             return 0;
@@ -634,14 +656,15 @@ bool SimpleMD::Initialise()
     m_eigen_masses = Eigen::VectorXd::Zero(3*m_natoms);
     m_eigen_inv_masses = Eigen::VectorXd::Zero(3*m_natoms);
 
+
     if (m_seed == -1) {
         const auto start = std::chrono::high_resolution_clock::now();
         m_seed = std::chrono::duration_cast<std::chrono::seconds>(start.time_since_epoch()).count();
     } else if (m_seed == 0)
         m_seed = m_natoms * m_T0;
     if (m_verbosity >= 1)
-        std::cout << "Random seed is " << m_seed << std::endl;
-    m_rng.seed(m_seed);
+        CurcumaLogger::raw("Random seed is ", m_seed);
+    m_rng.seed(static_cast<std::mt19937::result_type>(m_seed));
 
     if (m_initfile != "none") {
         json md;
@@ -727,7 +750,7 @@ bool SimpleMD::Initialise()
     } else if (m_seed == 0)
         m_seed = m_T0 * m_natoms;
     if (m_verbosity >= 1)
-        std::cout << "Random seed is " << m_seed << std::endl;
+        CurcumaLogger::raw("Random seed is ", m_seed);
     m_rng.seed(m_seed);
 
 
@@ -762,13 +785,10 @@ bool SimpleMD::Initialise()
     m_molecule.setCharge(0);
     if (!m_nocenter) {
         if (m_verbosity >= 1)
-            std::cout << "Move stucture to the origin ... " << std::endl;
+            CurcumaLogger::raw("Move stucture to the origin ... ");
         m_molecule.Center(m_COM);
     } else if (m_verbosity >= 1)
-        std::cout << "Move stucture NOT to the origin ... " << std::endl;
-
-
-
+        CurcumaLogger::raw("Move stucture NOT to the origin ... ");
     if (!m_restart) {
         m_eigen_geometry = Eigen::MatrixXd::Zero(m_natoms, 3);
         m_eigen_velocities = Eigen::MatrixXd::Zero(m_natoms, 3);
@@ -907,6 +927,21 @@ bool SimpleMD::Initialise()
         ec_config["output_dir"] = OutputDir();
     }
 
+    // RATTLE builds its constraint list once at initialisation and cannot follow a
+    // bond topology that changes during the run: refuse the combination with the
+    // GFN-FF react topology mode instead of constraining bonds that no longer exist.
+    // Claude Generated (Sep 2026).
+    if (m_config.get<int>("rattle") != 0) {
+        std::string topology_mode = ec_config.value("topology_mode", std::string("auto"));
+        if (ec_config.contains("gfnff") && ec_config["gfnff"].is_object())
+            topology_mode = ec_config["gfnff"].value("topology_mode", topology_mode);
+        if (topology_mode == "react") {
+            CurcumaLogger::error("SimpleMD: rattle is not available with gfnff topology_mode=react "
+                                 "(constraints are frozen at initialisation); set -md.rattle 0.");
+            return false;
+        }
+    }
+
     m_interface = new EnergyCalculator(m_method, ec_config, Basename());
     // Fail loud (Sep 2026): an unknown/unavailable method used to leave a calculator without a
     // backend and the first FastEnergy() call segfaulted. Abort the setup with the reason.
@@ -1016,16 +1051,16 @@ bool SimpleMD::Initialise()
         }
         if (m_restart) {
             if (m_verbosity >= 1) {
-                std::cout << "Reading structure files from " << m_rmsd_ref_file << std::endl;
+                CurcumaLogger::raw("Reading structure files from ", m_rmsd_ref_file);
                 for (const auto& i : m_bias_json)
-                    std::cout << i << std::endl;
+                    CurcumaLogger::raw(i);
             }
             FileIterator file(m_rmsd_ref_file);
             int index = 0;
             while (!file.AtEnd()) {
                 Molecule mol = file.Next();
                 if (m_verbosity >= 1)
-                    std::cout << m_bias_json[index] << std::endl;
+                    CurcumaLogger::raw(m_bias_json[index]);
                 int thread_index = index % m_bias_threads.size();
                 m_bias_threads[thread_index]->addGeometry(mol.getGeometry(), m_bias_json[index]);
                 ++index;
@@ -1034,7 +1069,7 @@ bool SimpleMD::Initialise()
         } else {
             if (m_rmsd_ref_file != "none") {
                 if (m_verbosity >= 1)
-                    std::cout << "Reading structure files from " << m_rmsd_ref_file << std::endl;
+                    CurcumaLogger::raw("Reading structure files from ", m_rmsd_ref_file);
                 int index = 0;
 
                 FileIterator file(m_rmsd_ref_file);
@@ -1047,6 +1082,54 @@ bool SimpleMD::Initialise()
                 m_bias_structure_count = index;
             }
         }
+    }
+
+    // Claude Generated 2026: umbrella restraint on a distance difference (umbrella_q)
+    if (!m_umbrella_q_spec.empty()) {
+        std::string err;
+        if (!parseUmbrellaQ(m_umbrella_q_spec, m_natoms, m_umbrella_q, err)) {
+            CurcumaLogger::error("umbrella_q '" + m_umbrella_q_spec + "': " + err);
+            return false;
+        }
+        if (m_extra_potential) {
+            CurcumaLogger::error("umbrella_q: the extra potential is already in use (umbrella_q is for plain -md only)");
+            return false;
+        }
+        const UmbrellaQ u = m_umbrella_q;
+        m_extra_potential = [u](const Geometry& R, Geometry& g) { return umbrellaQEnergy(u, R, g); };
+        m_umbrella_q_on = true;
+        CurcumaLogger::result_fmt("umbrella_q: q = d({},{}) - d({},{}), q0 = {:.4f} A, kappa = {:.6f} Eh/A^2",
+            u.i + 1, u.j + 1, u.i + 1, u.k + 1, u.q0, u.kappa);
+    }
+
+    // Claude Generated 2026: general umbrella restraint (umbrella_cv: diff | sum | dihedral)
+    if (!m_umbrella_cv_spec.empty()) {
+        if (m_umbrella_q_on) {
+            CurcumaLogger::error("umbrella_cv and umbrella_q are mutually exclusive (one restraint per run)");
+            return false;
+        }
+        std::string err;
+        if (!parseUmbrellaCV(m_umbrella_cv_spec, m_natoms, m_umbrella_cv, err)) {
+            CurcumaLogger::error("umbrella_cv '" + m_umbrella_cv_spec + "': " + err);
+            return false;
+        }
+        if (m_extra_potential) {
+            CurcumaLogger::error("umbrella_cv: the extra potential is already in use (umbrella_cv is for plain -md only)");
+            return false;
+        }
+        const UmbrellaCV u = m_umbrella_cv;
+        m_extra_potential = [u](const Geometry& R, Geometry& g) { return umbrellaCVEnergy(u, R, g); };
+        m_umbrella_cv_on = true;
+        const double deg = 180.0 / CurcumaUnit::Constants::PI;
+        if (u.type == UmbrellaCV::Dihedral)
+            CurcumaLogger::result_fmt("umbrella_cv: phi({},{},{},{}), phi0 = {:.3f} deg, kappa = {:.6f} Eh/rad^2",
+                u.i + 1, u.j + 1, u.k + 1, u.l + 1, u.q0 * deg, u.kappa);
+        else if (u.type == UmbrellaCV::Sum)
+            CurcumaLogger::result_fmt("umbrella_cv: q = d({},{}) + d({},{}), q0 = {:.4f} A, kappa = {:.6f} Eh/A^2",
+                u.i + 1, u.j + 1, u.k + 1, u.l + 1, u.q0, u.kappa);
+        else
+            CurcumaLogger::result_fmt("umbrella_cv: q = d({},{}) - d({},{}), q0 = {:.4f} A, kappa = {:.6f} Eh/A^2",
+                u.i + 1, u.j + 1, u.i + 1, u.k + 1, u.q0, u.kappa);
     }
 
     m_initialised = true;
@@ -1120,6 +1203,12 @@ void SimpleMD::InitConstrainedBonds()
         m_dof -= dof_com_removed;
         if (m_dof < 1) m_dof = 1;
     }
+
+    // Step 3 (Claude Generated 2026): a scalar (CV) constraint set BEFORE Initialise()
+    // removes one more DOF. setScalarConstraint() handles the usual case (set after
+    // prepareRun); this covers the reset of m_dof = 3N in Initialise().
+    if (m_scalar_constraint && m_dof > 1)
+        m_dof -= 1;
 
     // Report
     if (m_rattle) {
@@ -1386,7 +1475,7 @@ void SimpleMD::InitialiseWalls()
     }
     if (m_wall_render) {
         if (m_verbosity >= 1)
-            std::cout << "render walls" << std::endl;
+            CurcumaLogger::raw("render walls");
         if (m_wall_type == 1) {
             Position x0 = Position{ m_wall_spheric_radius, 0, 0 };
             Position x1 = Position{ -m_wall_spheric_radius, 0, 0 };
@@ -1939,6 +2028,32 @@ void SimpleMD::start()
     finalizeRun();
 }
 
+// Claude Generated (Sep 2026): plain-language reason for stopReason(), so a driver
+// can tell the user whether the run finished or fell apart. ASCII only (see the
+// no-UTF-symbols rule in CLAUDE.md).
+std::string SimpleMD::stopReasonText() const
+{
+    switch (m_stop_reason) {
+    case StopReason::Running:
+        return "still running";
+    case StopReason::NotPrepared:
+        return "not started (prepareRun was not called)";
+    case StopReason::MaxTime:
+        return "simulation time reached";
+    case StopReason::StopFile:
+        return "a 'stop' file was found in the working directory";
+    case StopReason::Unstable:
+        return "dynamics became unstable (NaN or Inf in gradient, velocities or energy)";
+    case StopReason::EpotAbort:
+        return "aborted: the mean potential energy left its allowed window (epot_abort)";
+    case StopReason::TempAbort:
+        return "aborted: the mean temperature ran away from the target (temp_abort)";
+    case StopReason::TopoCheck:
+        return "aborted: the molecule broke into more fragments than it started with (topo_check)";
+    }
+    return "unknown";
+}
+
 void SimpleMD::prepareRun()
 {
     if (m_initialised == false) {
@@ -1947,6 +2062,7 @@ void SimpleMD::prepareRun()
         return;
     }
     m_run_aborted = false;
+    m_stop_reason = StopReason::Running;
     m_run_states.clear();
 
     auto unix_timestamp = std::chrono::seconds(std::time(nullptr));
@@ -1983,15 +2099,35 @@ void SimpleMD::prepareRun()
     if (thermo == ThermostatType::None) {
         ThermostatFunction = [this] { None(); };
         if (m_verbosity >= 1)
-            std::cout << "No Thermostat applied\n"
-                      << std::endl;
+            CurcumaLogger::raw("No Thermostat applied\n");
     }
 
     m_Epot = Energy();
+    if (m_umbrella_q_on) { // Claude Generated 2026: the first half-kick sees the restraint too
+        ApplyExtraPotential();
+        m_umbrella_q_file.close();
+        m_umbrella_q_file.open(outputPath(Basename() + ".umbrella_q.csv"));
+        m_umbrella_q_file << "step,time_fs,q_A,d_ij_A,d_ik_A,W_Eh,Epot_Eh,Ekin_Eh\n";
+    }
+    if (m_umbrella_cv_on) { // Claude Generated 2026: as umbrella_q
+        ApplyExtraPotential();
+        m_umbrella_cv_file.close();
+        m_umbrella_cv_file.open(outputPath(Basename() + ".umbrella_cv.csv"));
+        if (m_umbrella_cv.type == UmbrellaCV::Dihedral)
+            m_umbrella_cv_file << "step,time_fs,cv_deg,dphi_deg,W_Eh,Epot_Eh,Ekin_Eh\n";
+        else if (m_umbrella_cv.type == UmbrellaCV::Sum)
+            m_umbrella_cv_file << "step,time_fs,cv_A,d_ij_A,d_kl_A,W_Eh,Epot_Eh,Ekin_Eh\n";
+        else
+            m_umbrella_cv_file << "step,time_fs,cv_A,d_ij_A,d_ik_A,W_Eh,Epot_Eh,Ekin_Eh\n";
+    }
     EKin();
     m_Etot = m_Epot + m_Ekin;
     AverageQuantities();
     m_step = 0;
+    if (m_umbrella_q_on)
+        WriteUmbrellaQ(0, m_currentStep);
+    if (m_umbrella_cv_on)
+        WriteUmbrellaCV(0, m_currentStep);
 
     // Claude Generated (2026): start the global ramp from the initial setpoint and resolve the
     // thermal regions (atom indices + default complement). A fresh prepareRun() clears any prior
@@ -2360,6 +2496,87 @@ double SimpleMD::RegionTemperature(const std::vector<int>& atoms, int dof) const
 /* Claude Generated 2026 - Read the temp_regions JSON array from the merged controller.
  * Each element: {atoms (FragString2Indicies grammar), temperature, temp_schedule?}. Only the
  * specs are stored here; atom indices are resolved in prepareRun() once the molecule is known. */
+// Claude Generated 2026 - Read the configured external potentials. A malformed
+// entry is an error the run should not start with: a bias that silently does
+// nothing is worse than one that refuses.
+void SimpleMD::ParseExternalPotentials()
+{
+    m_external_potentials.clear();
+    json cfg = m_config.exportConfig();
+    if (!cfg.contains("external_potentials"))
+        return;
+
+    std::string error;
+    std::vector<curcuma::ExternalPotential> parsed
+        = curcuma::parseExternalPotentials(cfg["external_potentials"], m_molecule, &error);
+    if (!error.empty()) {
+        CurcumaLogger::error("external_potentials: " + error);
+        return;
+    }
+    m_external_potentials = std::move(parsed);
+    if (!m_external_potentials.empty() && m_verbosity >= 1) {
+        CurcumaLogger::info("external potentials: "
+            + std::to_string(m_external_potentials.size()) + " configured");
+    }
+}
+
+// Claude Generated 2026 - Energy and gradient of the configured potentials, in the
+// same place the walls are applied and with the same sign convention. A pending
+// replacement is taken up here, so a change reaches the very next step.
+void SimpleMD::ApplyExternalPotentials()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_external_potential_mutex);
+        if (m_pending_external_potentials_valid) {
+            m_external_potentials = std::move(m_pending_external_potentials);
+            m_pending_external_potentials.clear();
+            m_pending_external_potentials_valid = false;
+        }
+    }
+    if (m_external_potentials.empty()) {
+        m_external_potential_energy = 0.0;
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(m_external_potential_mutex);
+    m_external_potential_energy = curcuma::applyExternalPotentials(
+        m_external_potentials, m_eigen_geometry, m_previous_geometry, m_eigen_gradient);
+    m_previous_geometry = m_eigen_geometry;
+}
+
+bool SimpleMD::setExternalPotentials(const json& list, std::string* error)
+{
+    std::string message;
+    std::vector<curcuma::ExternalPotential> parsed
+        = curcuma::parseExternalPotentials(list, m_molecule, &message);
+    if (!message.empty()) {
+        if (error)
+            *error = message;
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(m_external_potential_mutex);
+    m_pending_external_potentials = std::move(parsed);
+    m_pending_external_potentials_valid = true;
+    if (error)
+        error->clear();
+    return true;
+}
+
+double SimpleMD::externalWork() const
+{
+    std::lock_guard<std::mutex> lock(m_external_potential_mutex);
+    double work = 0.0;
+    for (const curcuma::ExternalPotential& potential : m_external_potentials)
+        work += potential.work;
+    return work;
+}
+
+json SimpleMD::externalPotentials() const
+{
+    std::lock_guard<std::mutex> lock(m_external_potential_mutex);
+    return curcuma::describeExternalPotentials(m_external_potentials);
+}
+
 void SimpleMD::ParseThermalRegions()
 {
     m_thermal_regions.clear();
@@ -2497,7 +2714,9 @@ void SimpleMD::ApplyThermostatRegion(const std::vector<int>& atoms, double T0, i
         const double Ekin_target = 0.5 * kb_Eh * T0 * dof;
         const double c = std::exp(-(m_dT / 2.0 * m_respa) / m_coupling);
         std::normal_distribution<double> dnorm{ 0.0, 1.0 };
-        std::chi_squared_distribution<double> dchi{ static_cast<double>(dof) };
+        // Claude Generated: Bussi 2007 (JCP 126, 014101) Eq. A7: R1 is drawn separately, the
+        // remaining sum of squares is chi2(Nf-1), not chi2(Nf).
+        std::chi_squared_distribution<double> dchi{ static_cast<double>(std::max(1, static_cast<int>(dof) - 1)) };
         const double R = dnorm(m_rng);
         const double SNf = dchi(m_rng);
         const double alpha2 = c + (1 - c) * (SNf + R * R) * Ekin_target / (dof * Ekin)
@@ -2531,17 +2750,22 @@ void SimpleMD::ApplyThermostatRegion(const std::vector<int>& atoms, double T0, i
  * very top so the contribution is folded into the upcoming integrator step. */
 bool SimpleMD::step()
 {
-    if (!m_run_prepared)
+    if (!m_run_prepared) {
+        m_stop_reason = StopReason::NotPrepared;
         return false;
+    }
 
-    if (!(m_maxtime <= 0 || m_currentStep < m_maxtime))
+    if (!(m_maxtime <= 0 || m_currentStep < m_maxtime)) {
+        m_stop_reason = StopReason::MaxTime;
         return false;
+    }
 
     auto step0 = std::chrono::system_clock::now();
 
     if (CheckStop() == true) {
         TriggerWriteRestart();
         m_run_aborted = true;
+        m_stop_reason = StopReason::StopFile;
 #ifdef USE_Plumed
         if (m_mtd) {
             plumed_finalize(m_plumedmain);
@@ -2551,12 +2775,12 @@ bool SimpleMD::step()
     }
 
     // Claude Generated 2026 - Inject queued external forces before integration.
-    // The contribution is consumed (cleared) in a single step; callers must
-    // re-apply each step while the user is actively dragging an atom.
+    // The contribution is re-applied by Verlet()/Rattle() after WallPotential() so the
+    // external (e.g. NEB-MD spring) force acts on BOTH velocity half-kicks, making the
+    // scheme time-symmetric for a constant external force. It is cleared after the
+    // integrator returns (below). Callers must re-apply each step.
     if (m_external_forces_pending) {
         m_eigen_gradient += m_external_forces;
-        m_external_forces.setZero();
-        m_external_forces_pending = false;
     }
 
     // Claude Generated 2026 - advance the multi-stage temperature ramp BEFORE the
@@ -2586,6 +2810,12 @@ bool SimpleMD::step()
         IntegratorStep();
     }
     m_last_integrator_ms = integrator_ms;
+    // Claude Generated 2026: clear the external-force buffer now that Verlet/Rattle
+    // have consumed it at both half-kicks.
+    if (m_external_forces_pending) {
+        m_external_forces.setZero();
+        m_external_forces_pending = false;
+    }
     AverageQuantities();
 
     // Claude Generated (Jun 2026): ConfSearch robustness gates (opt-in, default off).
@@ -2607,6 +2837,7 @@ bool SimpleMD::step()
                 "MD aborted: <Epot> climbed {:.1f} kJ/mol above start (window {:.1f})\n",
                 (m_aver_Epot - m_epot_ref) * 2625.5, m_epot_abort_window);
         m_run_aborted = true;
+        m_stop_reason = StopReason::EpotAbort;
         return false;
     }
     // Temperature runaway abort: the shared bias pool's hills (W_i = k*counter_i) grow over
@@ -2624,6 +2855,7 @@ bool SimpleMD::step()
                     "MD aborted: <T>={:.0f} K ran away from target {:.0f} K (factor limit {}x, delta limit {} K)\n",
                     m_aver_Temp, m_T0, m_temp_abort_factor, m_temp_abort_delta);
             m_run_aborted = true;
+            m_stop_reason = StopReason::TempAbort;
             return false;
         }
     }
@@ -2640,6 +2872,7 @@ bool SimpleMD::step()
                     "MD aborted: topology broke (fragments {} -> {})\n",
                     m_start_fragment_count, nfrag);
             m_run_aborted = true;
+            m_stop_reason = StopReason::TopoCheck;
             return false;
         }
     }
@@ -2649,7 +2882,7 @@ bool SimpleMD::step()
             if (std::abs(m_T0 - m_aver_Temp) < m_mtd_dT && m_step > 10) {
                 m_eval_mtd = true;
                 if (m_verbosity >= 1)
-                    std::cout << "Starting with MetaDynamics ..." << std::endl;
+                    CurcumaLogger::raw("Starting with MetaDynamics ...");
             }
         }
     }
@@ -2681,9 +2914,24 @@ bool SimpleMD::step()
     }
     //////////// Dipole
 
+    // Claude Generated 2026: positions, Epot, Ekin here belong to the end of step m_step + 1
+    if (m_umbrella_q_on && (m_step + 1) % m_umbrella_q_frequency == 0)
+        WriteUmbrellaQ(m_step + 1, m_currentStep + m_dT);
+    if (m_umbrella_cv_on && (m_step + 1) % m_umbrella_cv_frequency == 0)
+        WriteUmbrellaCV(m_step + 1, m_currentStep + m_dT);
+
     if (m_step % m_dump == 0) {
         if (bool write = WriteGeometry()) {
-            m_run_states.push_back(WriteRestartInformation());
+            // K6 (Oct 2026, Claude Generated): m_run_states is read only by the -rescue branch
+            // below; without -rescue it was a 640 kB-per-dump copy (polymer_2x) that nobody read.
+            // With -rescue, reuse the state WriteGeometry() -> TriggerWriteRestart() just built
+            // (nothing changes the restart state in between) instead of building it twice.
+            if (m_rescue) {
+                if (m_last_dump_state.is_null())
+                    m_last_dump_state = WriteRestartInformation();
+                m_run_states.push_back(std::move(m_last_dump_state));
+            }
+            m_last_dump_state = json();
             m_current_rescue = 0;
             // WP-S2 (May 2026): append diagnostics record parallel to XYZ trajectory
             if (m_md_diagnostics && m_diag_writer) {
@@ -2713,7 +2961,7 @@ bool SimpleMD::step()
             }
         } else if (!write && m_rescue && m_run_states.size() > (1 - m_current_rescue)) {
             if (m_verbosity >= 1)
-                std::cout << "Molecule exploded, resetting to previous state ..." << std::endl;
+                CurcumaLogger::raw("Molecule exploded, resetting to previous state ...");
             LoadRestartInformation(m_run_states[m_run_states.size() - 1 - m_current_rescue]);
             Geometry geometry = m_molecule.getGeometry();
             for (int i = 0; i < m_natoms; ++i) {
@@ -2747,6 +2995,7 @@ bool SimpleMD::step()
 
         m_time_step = 0;
         m_run_aborted = true;
+        m_stop_reason = StopReason::Unstable;
 
 #ifdef USE_Plumed
         if (m_mtd) {
@@ -2816,7 +3065,7 @@ void SimpleMD::finalizeRun()
 
     PrintStatus();
     if (m_thermostat == "csvr" && m_verbosity >= 1)
-        std::cout << "Exchange with heat bath " << m_Ekin_exchange << "Eh" << std::endl;
+        CurcumaLogger::raw("Exchange with heat bath ", m_Ekin_exchange, "Eh");
     // Claude Generated (Sep 2026): report how often the adaptive integrator had to act
     if (m_adaptive_step && m_verbosity >= 1) {
         CurcumaLogger::result("Adaptive step: " + std::to_string(m_adaptive_rejections)
@@ -2827,7 +3076,7 @@ void SimpleMD::finalizeRun()
                 + " of them caught by the hottest-atom criterion alone");
     }
     if (m_dipole && m_verbosity >= 1) {
-        std::cout << "Calculated averaged dipole moment " << m_aver_dipol_linear * 2.5418 << " Debye and " << m_aver_dipol_linear * 2.5418 * 3.3356 << " Cm [e-30]" << std::endl;
+        CurcumaLogger::raw("Calculated averaged dipole moment ", m_aver_dipol_linear * 2.5418, " Debye and ", m_aver_dipol_linear * 2.5418 * 3.3356, " Cm [e-30]");
     }
 
 #ifdef USE_Plumed
@@ -2837,13 +3086,12 @@ void SimpleMD::finalizeRun()
 #endif
     if (m_rmsd_mtd) {
         if (m_verbosity >= 1)
-            std::cout << "Sum of Energy of COLVARs:" << std::endl;
+            CurcumaLogger::raw("Sum of Energy of COLVARs:");
         for (int i = 0; i < m_bias_threads.size(); ++i) {
             auto structures = m_bias_threads[i]->getBiasStructure();
             for (int j = 0; j < structures.size(); ++j) {
                 if (m_verbosity >= 1)
-                    std::cout << structures[j].rmsd_reference << "\t" << structures[j].energy << "\t" << structures[j].counter / static_cast<double>(m_colvar_incr) * 100 << std::endl;
-
+                    CurcumaLogger::raw(structures[j].rmsd_reference, "\t", structures[j].energy, "\t", structures[j].counter / static_cast<double>(m_colvar_incr) * 100);
                 m_rmsd_mtd_molecule.setGeometry(structures[j].geometry);
                 m_rmsd_mtd_molecule.setEnergy(structures[j].energy);
                 m_rmsd_mtd_molecule.setName(std::to_string(structures[j].index) + " " + std::to_string(structures[j].rmsd_reference));
@@ -3000,6 +3248,274 @@ void SimpleMD::writeMtdProvenance()
  * next step() call. Forces are in Hartree/Bohr (same units as m_eigen_gradient).
  * The contribution is added additively and then cleared, so callers must re-queue
  * each step while a user drag is active. Shape check: forces must match (natoms, 3). */
+void SimpleMD::ApplyExtraPotential()
+{
+    // Claude Generated 2026: additional potential W(R) set by the caller (setExtraPotential()).
+    // Added to the gradient BEFORE m_gradient_true is stored, so trueGradient() = d(E + walls + W)/dR,
+    // i.e. the gradient of the potential the dynamics actually samples.
+    if (!m_extra_potential)
+        return;
+    Geometry g;
+    m_extra_energy = m_extra_potential(m_eigen_geometry, g);
+    if (g.rows() == m_eigen_gradient.rows() && g.cols() == m_eigen_gradient.cols()) {
+        m_eigen_gradient += g;
+        m_extra_gradient = g; // same step as m_gradient_true, see extraPotentialGradient()
+    } else {
+        m_extra_gradient.resize(0, 3);
+    }
+}
+
+/* Claude Generated 2026: umbrella restraint on a distance difference (docs/UMBRELLA_Q.md).
+ *   q = |R_i - R_j| - |R_i - R_k|,   W = kappa/2 (q - q0)^2
+ *   dW/dR_i = kappa (q - q0) [ (R_i - R_j)/d_ij - (R_i - R_k)/d_ik ]
+ *   dW/dR_j = -kappa (q - q0) (R_i - R_j)/d_ij,   dW/dR_k = +kappa (q - q0) (R_i - R_k)/d_ik
+ * Units: R in Angstrom, kappa in Eh/A^2, W in Eh, gradient in Eh/A (SimpleMD internal units). */
+double SimpleMD::umbrellaQEnergy(const UmbrellaQ& u, const Geometry& R, Geometry& grad, double* q, double* dij, double* dik)
+{
+    const Eigen::RowVector3d rij = R.row(u.i) - R.row(u.j), rik = R.row(u.i) - R.row(u.k);
+    const double d1 = rij.norm(), d2 = rik.norm(), dq = (d1 - d2) - u.q0;
+    grad = Geometry::Zero(R.rows(), 3);
+    grad.row(u.i) = u.kappa * dq * (rij / d1 - rik / d2);
+    grad.row(u.j) = -u.kappa * dq * rij / d1;
+    grad.row(u.k) = u.kappa * dq * rik / d2;
+    if (q) *q = d1 - d2;
+    if (dij) *dij = d1;
+    if (dik) *dik = d2;
+    return 0.5 * u.kappa * dq * dq;
+}
+
+bool SimpleMD::parseUmbrellaQ(const std::string& spec, int natoms, UmbrellaQ& out, std::string& error)
+{
+    std::vector<std::string> f;
+    std::stringstream ss(spec);
+    for (std::string t; std::getline(ss, t, ',');)
+        f.push_back(t);
+    if (f.size() != 5) {
+        error = "expected 5 comma-separated fields i,j,k,q0,kappa, got " + std::to_string(f.size());
+        return false;
+    }
+    int idx[3];
+    double q0 = 0.0, kappa = 0.0;
+    try {
+        for (int n = 0; n < 3; ++n) {
+            std::size_t pos = 0;
+            idx[n] = std::stoi(f[n], &pos);
+            if (f[n].find_first_not_of(" ", pos) != std::string::npos) throw std::invalid_argument(f[n]);
+        }
+        std::size_t p1 = 0, p2 = 0;
+        q0 = std::stod(f[3], &p1);
+        kappa = std::stod(f[4], &p2);
+        if (f[3].find_first_not_of(" ", p1) != std::string::npos || f[4].find_first_not_of(" ", p2) != std::string::npos)
+            throw std::invalid_argument("trailing text");
+    } catch (const std::exception&) {
+        error = "non-numeric field";
+        return false;
+    }
+    for (int n = 0; n < 3; ++n)
+        if (idx[n] < 1 || idx[n] > natoms) {
+            error = "atom index " + std::to_string(idx[n]) + " out of range 1.." + std::to_string(natoms);
+            return false;
+        }
+    if (idx[0] == idx[1] || idx[0] == idx[2] || idx[1] == idx[2]) {
+        error = "atom indices must be distinct";
+        return false;
+    }
+    if (!(kappa > 0.0) || !std::isfinite(q0) || !std::isfinite(kappa)) {
+        error = "kappa must be > 0 (kcal/mol/A^2)";
+        return false;
+    }
+    out.i = idx[0] - 1;
+    out.j = idx[1] - 1;
+    out.k = idx[2] - 1;
+    out.q0 = q0;
+    out.kappa = CurcumaUnit::Energy::kcalmol_to_hartree(kappa); // kcal/mol/A^2 -> Eh/A^2
+    return true;
+}
+
+void SimpleMD::WriteUmbrellaQ(int step, double time_fs)
+{
+    Geometry g;
+    double q = 0.0, dij = 0.0, dik = 0.0;
+    const double W = umbrellaQEnergy(m_umbrella_q, m_eigen_geometry, g, &q, &dij, &dik);
+    m_umbrella_q_file << fmt::format("{},{:.4f},{:.8f},{:.8f},{:.8f},{:.10e},{:.10f},{:.10f}\n",
+        step, time_fs, q, dij, dik, W, m_Epot, m_Ekin);
+}
+
+/* Claude Generated 2026: signed dihedral phi(i,j,k,l), IUPAC / Klyne-Prelog sign convention:
+ * looking along j -> k, phi > 0 when the front bond j-i turns clockwise (< 180 deg) onto the back
+ * bond k-l; cis 0, gauche +-60, trans 180. Identical to gfnff_geometry.h calculateDihedralAngle
+ * (checked in test_umbrella_q). Molecule::CalculateDihedral is NOT this convention (0..2pi, and it
+ * clamps the unnormalised normal dot product), do not compare against it.  With F = R_i - R_j, G = R_j - R_k, H = R_l - R_k, A = F x G, B = H x G:
+ *   cos phi = A.B / (|A||B|),   sin phi = (B x A).G / (|A||B||G|),   phi = atan2(sin, cos)
+ * Gradient (Blondel & Karplus, J. Comput. Chem. 17, 1132 (1996); Bekker et al.):
+ *   dphi/dR_i = -|G|/|A|^2 A
+ *   dphi/dR_j = +|G|/|A|^2 A + (F.G)/(|A|^2|G|) A - (H.G)/(|B|^2|G|) B
+ *   dphi/dR_k = +(H.G)/(|B|^2|G|) B - (F.G)/(|A|^2|G|) A - |G|/|B|^2 B
+ *   dphi/dR_l = +|G|/|B|^2 B
+ * |A| = |F||G| sin(angle ijk) and |B| = |H||G| sin(angle jkl): a linear bond angle makes phi
+ * undefined, so |sin| < 1e-6 throws instead of dividing by zero. */
+double SimpleMD::dihedralAngle(const Geometry& R, int i, int j, int k, int l, Eigen::Matrix<double, 4, 3>* dphi)
+{
+    const Eigen::Vector3d F = (R.row(i) - R.row(j)).transpose();
+    const Eigen::Vector3d G = (R.row(j) - R.row(k)).transpose();
+    const Eigen::Vector3d H = (R.row(l) - R.row(k)).transpose();
+    const Eigen::Vector3d A = F.cross(G), B = H.cross(G);
+    const double nA = A.norm(), nB = B.norm(), nG = G.norm();
+    if (nG == 0.0 || nA < 1e-6 * F.norm() * nG || nB < 1e-6 * H.norm() * nG)
+        throw std::runtime_error(fmt::format("umbrella_cv dihedral {}-{}-{}-{}: bond angle {}-{}-{} or {}-{}-{} is linear "
+                                             "(|sin| < 1e-6), the dihedral is undefined",
+            i + 1, j + 1, k + 1, l + 1, i + 1, j + 1, k + 1, j + 1, k + 1, l + 1));
+    const double phi = std::atan2(B.cross(A).dot(G) / (nA * nB * nG), A.dot(B) / (nA * nB));
+    if (dphi) {
+        const double fg = F.dot(G), hg = H.dot(G), a2 = nA * nA, b2 = nB * nB;
+        dphi->row(0) = -nG / a2 * A;
+        dphi->row(1) = nG / a2 * A + fg / (a2 * nG) * A - hg / (b2 * nG) * B;
+        dphi->row(2) = hg / (b2 * nG) * B - fg / (a2 * nG) * A - nG / b2 * B;
+        dphi->row(3) = nG / b2 * B;
+    }
+    return phi;
+}
+
+/* Claude Generated 2026: general umbrella restraint (docs/UMBRELLA_Q.md), W = kappa/2 (q - q0)^2.
+ *   diff:     q = d_ij - d_ik                 -> umbrellaQEnergy (same code as umbrella_q)
+ *   sum:      q = d_ij + d_kl,  dW/dR_i = kappa (q - q0) (R_i - R_j)/d_ij = -dW/dR_j,
+ *                               dW/dR_k = kappa (q - q0) (R_k - R_l)/d_kl = -dW/dR_l
+ *   dihedral: dq = phi - phi0 wrapped to [-pi, pi] (periodic), dW/dR = kappa dq dphi/dR
+ * Units: R in Angstrom, kappa in Eh/A^2 (diff, sum) or Eh/rad^2 (dihedral), gradient in Eh/A.
+ * When i == k or j == l in a sum, the row contributions add up (+=). */
+double SimpleMD::umbrellaCVEnergy(const UmbrellaCV& u, const Geometry& R, Geometry& grad, double* cv, double* a1, double* a2)
+{
+    if (u.type == UmbrellaCV::Diff) {
+        UmbrellaQ q;
+        q.i = u.i;
+        q.j = u.j;
+        q.k = u.k;
+        q.q0 = u.q0;
+        q.kappa = u.kappa;
+        return umbrellaQEnergy(q, R, grad, cv, a1, a2);
+    }
+    grad = Geometry::Zero(R.rows(), 3);
+    if (u.type == UmbrellaCV::Sum) {
+        const Eigen::RowVector3d rij = R.row(u.i) - R.row(u.j), rkl = R.row(u.k) - R.row(u.l);
+        const double d1 = rij.norm(), d2 = rkl.norm(), dq = (d1 + d2) - u.q0;
+        grad.row(u.i) += u.kappa * dq * rij / d1;
+        grad.row(u.j) -= u.kappa * dq * rij / d1;
+        grad.row(u.k) += u.kappa * dq * rkl / d2;
+        grad.row(u.l) -= u.kappa * dq * rkl / d2;
+        if (cv) *cv = d1 + d2;
+        if (a1) *a1 = d1;
+        if (a2) *a2 = d2;
+        return 0.5 * u.kappa * dq * dq;
+    }
+    const double pi = CurcumaUnit::Constants::PI;
+    Eigen::Matrix<double, 4, 3> dphi;
+    const double phi = dihedralAngle(R, u.i, u.j, u.k, u.l, &dphi);
+    const double dq = std::remainder(phi - u.q0, 2.0 * pi); // wrapped to [-pi, pi]
+    grad.row(u.i) = u.kappa * dq * dphi.row(0);
+    grad.row(u.j) = u.kappa * dq * dphi.row(1);
+    grad.row(u.k) = u.kappa * dq * dphi.row(2);
+    grad.row(u.l) = u.kappa * dq * dphi.row(3);
+    if (cv) *cv = phi;
+    if (a1) *a1 = dq;
+    if (a2) *a2 = 0.0;
+    return 0.5 * u.kappa * dq * dq;
+}
+
+bool SimpleMD::parseUmbrellaCV(const std::string& spec, int natoms, UmbrellaCV& out, std::string& error)
+{
+    const std::size_t comma = spec.find(',');
+    std::string type = spec.substr(0, comma);
+    type.erase(0, type.find_first_not_of(' '));
+    type.erase(type.find_last_not_of(' ') + 1);
+    const std::string rest = comma == std::string::npos ? "" : spec.substr(comma + 1);
+    if (type == "diff") { // synonym of umbrella_q
+        UmbrellaQ q;
+        if (!parseUmbrellaQ(rest, natoms, q, error))
+            return false;
+        out = UmbrellaCV();
+        out.type = UmbrellaCV::Diff;
+        out.i = q.i;
+        out.j = q.j;
+        out.k = q.k;
+        out.q0 = q.q0;
+        out.kappa = q.kappa;
+        return true;
+    }
+    if (type != "sum" && type != "dihedral") {
+        error = "unknown type '" + type + "' (expected diff, sum or dihedral)";
+        return false;
+    }
+    std::vector<std::string> f;
+    std::stringstream ss(rest);
+    for (std::string t; std::getline(ss, t, ',');)
+        f.push_back(t);
+    if (comma == std::string::npos || f.size() != 6) {
+        error = "expected " + type + ",i,j,k,l," + (type == "sum" ? "q0" : "phi0") + ",kappa (7 fields)";
+        return false;
+    }
+    int idx[4];
+    double v[2];
+    try {
+        for (int n = 0; n < 4; ++n) {
+            std::size_t pos = 0;
+            idx[n] = std::stoi(f[n], &pos);
+            if (f[n].find_first_not_of(" ", pos) != std::string::npos) throw std::invalid_argument(f[n]);
+        }
+        for (int n = 0; n < 2; ++n) {
+            std::size_t pos = 0;
+            v[n] = std::stod(f[4 + n], &pos);
+            if (f[4 + n].find_first_not_of(" ", pos) != std::string::npos) throw std::invalid_argument(f[4 + n]);
+        }
+    } catch (const std::exception&) {
+        error = "non-numeric field";
+        return false;
+    }
+    for (int n = 0; n < 4; ++n)
+        if (idx[n] < 1 || idx[n] > natoms) {
+            error = "atom index " + std::to_string(idx[n]) + " out of range 1.." + std::to_string(natoms);
+            return false;
+        }
+    if (type == "sum" && (idx[0] == idx[1] || idx[2] == idx[3])) {
+        error = "sum needs i != j and k != l";
+        return false;
+    }
+    if (type == "dihedral")
+        for (int a = 0; a < 4; ++a)
+            for (int b = a + 1; b < 4; ++b)
+                if (idx[a] == idx[b]) {
+                    error = "dihedral atom indices must be distinct";
+                    return false;
+                }
+    if (!(v[1] > 0.0) || !std::isfinite(v[0]) || !std::isfinite(v[1])) {
+        error = std::string("kappa must be > 0 (kcal/mol/") + (type == "sum" ? "A^2)" : "rad^2)");
+        return false;
+    }
+    out = UmbrellaCV();
+    out.type = type == "sum" ? UmbrellaCV::Sum : UmbrellaCV::Dihedral;
+    out.i = idx[0] - 1;
+    out.j = idx[1] - 1;
+    out.k = idx[2] - 1;
+    out.l = idx[3] - 1;
+    // q0: Angstrom (sum) or degrees -> rad (dihedral); kappa: kcal/mol per A^2 or rad^2 -> Eh
+    out.q0 = type == "sum" ? v[0] : v[0] * CurcumaUnit::Constants::PI / 180.0;
+    out.kappa = CurcumaUnit::Energy::kcalmol_to_hartree(v[1]);
+    return true;
+}
+
+void SimpleMD::WriteUmbrellaCV(int step, double time_fs)
+{
+    Geometry g;
+    double cv = 0.0, a1 = 0.0, a2 = 0.0;
+    const double W = umbrellaCVEnergy(m_umbrella_cv, m_eigen_geometry, g, &cv, &a1, &a2);
+    if (m_umbrella_cv.type == UmbrellaCV::Dihedral) {
+        const double deg = 180.0 / CurcumaUnit::Constants::PI;
+        m_umbrella_cv_file << fmt::format("{},{:.4f},{:.6f},{:.6f},{:.10e},{:.10f},{:.10f}\n",
+            step, time_fs, cv * deg, a1 * deg, W, m_Epot, m_Ekin);
+    } else
+        m_umbrella_cv_file << fmt::format("{},{:.4f},{:.8f},{:.8f},{:.8f},{:.10e},{:.10f},{:.10f}\n",
+            step, time_fs, cv, a1, a2, W, m_Epot, m_Ekin);
+}
+
 void SimpleMD::applyExternalForces(const Geometry& forces)
 {
     if (forces.rows() != m_natoms || forces.cols() != 3)
@@ -3023,10 +3539,158 @@ void SimpleMD::AdjustRattleTolerance()
     else if (m_aver_rattle_Temp < m_T0)
         m_rattle_tol_12 += 0.01;
     if (m_verbosity >= 1)
-        std::cout << m_rattle_counter << " " << m_aver_rattle_Temp << " " << m_rattle_tol_12 << std::endl;
+        CurcumaLogger::raw(m_rattle_counter, " ", m_aver_rattle_Temp, " ", m_rattle_tol_12);
     m_rattle_tol_12 = std::abs(m_rattle_tol_12);
     m_rattle_counter = 0;
     m_aver_rattle_Temp = 0;
+}
+
+// Claude Generated (Sep 2026): wall_potential = pbc — see the header for the
+// rationale and the limitation. Whole fragments are relocated, never single atoms.
+void SimpleMD::wrapIntoContainer()
+{
+    if (!m_wall_wrap)
+        return;
+
+    // Cheap O(N) gate: only pay for the fragment analysis when something actually
+    // left. In a well-sized container that is rare.
+    bool any_outside = false;
+    for (int i = 0; i < m_natoms && !any_outside; ++i) {
+        const double x = m_eigen_geometry(i, 0), y = m_eigen_geometry(i, 1), z = m_eigen_geometry(i, 2);
+        if (m_wall_type == 1) {
+            any_outside = (std::sqrt(x * x + y * y + z * z) > m_wall_spheric_radius);
+        } else {
+            any_outside = (x < m_wall_x_min || x > m_wall_x_max
+                || y < m_wall_y_min || y > m_wall_y_max
+                || z < m_wall_z_min || z > m_wall_z_max);
+        }
+    }
+    if (!any_outside)
+        return;
+
+    // Fragments from the CURRENT geometry: in a reactive run molecules combine and
+    // split, so a list cached at start-up would move the wrong atoms together.
+    m_molecule.setGeometry(m_eigen_geometry);
+    const std::vector<std::vector<int>> fragments = m_molecule.GetFragments();
+
+    // Clearance a wrapped fragment must find at its destination (Angstrom): below a
+    // covalent bond length, so a wrap into a gap is still allowed, but a direct hit
+    // is not.
+    constexpr double kWrapClearance = 1.8;
+
+    int wrapped = 0, reflected = 0;
+    for (const std::vector<int>& fragment : fragments) {
+        if (fragment.empty())
+            continue;
+
+        // Centre of mass decides for the whole fragment.
+        double mass_sum = 0.0, cx = 0.0, cy = 0.0, cz = 0.0;
+        for (int a : fragment) {
+            const double m = Elements::AtomicMass[m_atomtype[a]];
+            mass_sum += m;
+            cx += m * m_eigen_geometry(a, 0);
+            cy += m * m_eigen_geometry(a, 1);
+            cz += m * m_eigen_geometry(a, 2);
+        }
+        if (mass_sum <= 0.0)
+            continue;
+        cx /= mass_sum; cy /= mass_sum; cz /= mass_sum;
+
+        double dx = 0.0, dy = 0.0, dz = 0.0;
+        double nx = 0.0, ny = 0.0, nz = 0.0;  // outward normal of the crossed boundary
+        if (m_wall_type == 1) {
+            // Sphere: leave at r, re-enter at the antipodal point, the same distance
+            // inside the boundary. A sphere does not tile space, so this is a
+            // container rule rather than a lattice translation.
+            const double r = std::sqrt(cx * cx + cy * cy + cz * cz);
+            if (r <= m_wall_spheric_radius || r < 1e-12)
+                continue;
+            const double scale = (r - 2.0 * m_wall_spheric_radius) / r;
+            dx = cx * scale - cx;
+            dy = cy * scale - cy;
+            dz = cz * scale - cz;
+            nx = cx / r; ny = cy / r; nz = cz / r;
+        } else {
+            // Box: ordinary per-axis wrap by one box length.
+            const double lx = m_wall_x_max - m_wall_x_min;
+            const double ly = m_wall_y_max - m_wall_y_min;
+            const double lz = m_wall_z_max - m_wall_z_min;
+            if (lx <= 0.0 || ly <= 0.0 || lz <= 0.0)
+                continue;
+            if (cx < m_wall_x_min) { dx = lx * std::ceil((m_wall_x_min - cx) / lx); nx = -1.0; }
+            else if (cx > m_wall_x_max) { dx = -lx * std::ceil((cx - m_wall_x_max) / lx); nx = 1.0; }
+            if (cy < m_wall_y_min) { dy = ly * std::ceil((m_wall_y_min - cy) / ly); ny = -1.0; }
+            else if (cy > m_wall_y_max) { dy = -ly * std::ceil((cy - m_wall_y_max) / ly); ny = 1.0; }
+            if (cz < m_wall_z_min) { dz = lz * std::ceil((m_wall_z_min - cz) / lz); nz = -1.0; }
+            else if (cz > m_wall_z_max) { dz = -lz * std::ceil((cz - m_wall_z_max) / lz); nz = 1.0; }
+            if (dx == 0.0 && dy == 0.0 && dz == 0.0)
+                continue;
+            const double nn = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nn > 0.0) { nx /= nn; ny /= nn; nz /= nn; }
+        }
+
+        // Would the wrapped fragment land on something? Without a minimum-image
+        // convention in the energy the destination is genuinely occupied space, and
+        // dropping a molecule into it produces an overlap the force field answers
+        // with a diverging repulsion (measured: a 0.02 A contact, then NaN one step
+        // later). Only wrap into free space. Claude Generated (Sep 2026).
+        bool destination_free = true;
+        for (int a : fragment) {
+            const double px = m_eigen_geometry(a, 0) + dx;
+            const double py = m_eigen_geometry(a, 1) + dy;
+            const double pz = m_eigen_geometry(a, 2) + dz;
+            for (int b = 0; b < m_natoms && destination_free; ++b) {
+                if (std::find(fragment.begin(), fragment.end(), b) != fragment.end())
+                    continue;
+                const double ddx = px - m_eigen_geometry(b, 0);
+                const double ddy = py - m_eigen_geometry(b, 1);
+                const double ddz = pz - m_eigen_geometry(b, 2);
+                if (ddx * ddx + ddy * ddy + ddz * ddz < kWrapClearance * kWrapClearance)
+                    destination_free = false;
+            }
+            if (!destination_free)
+                break;
+        }
+
+        if (!destination_free) {
+            // Occupied: reflect the fragment elastically instead. Reversing the
+            // outward component of its centre-of-mass velocity keeps it in the
+            // container and conserves kinetic energy exactly, so this fallback does
+            // not heat the system either. Internal motion is untouched.
+            double vn = 0.0;
+            for (int a : fragment) {
+                const double m = Elements::AtomicMass[m_atomtype[a]];
+                vn += m * (m_eigen_velocities(a, 0) * nx + m_eigen_velocities(a, 1) * ny
+                    + m_eigen_velocities(a, 2) * nz);
+            }
+            vn /= mass_sum;
+            if (vn > 0.0) {  // only when it is actually leaving
+                for (int a : fragment) {
+                    m_eigen_velocities(a, 0) -= 2.0 * vn * nx;
+                    m_eigen_velocities(a, 1) -= 2.0 * vn * ny;
+                    m_eigen_velocities(a, 2) -= 2.0 * vn * nz;
+                }
+                ++reflected;
+            }
+            continue;
+        }
+
+        // One common translation keeps the fragment's internal geometry and its
+        // velocities untouched, so the wrap adds no energy.
+        for (int a : fragment) {
+            m_eigen_geometry(a, 0) += dx;
+            m_eigen_geometry(a, 1) += dy;
+            m_eigen_geometry(a, 2) += dz;
+        }
+        ++wrapped;
+    }
+
+    if (wrapped > 0)
+        m_molecule.setGeometry(m_eigen_geometry);
+    if ((wrapped > 0 || reflected > 0) && m_verbosity >= 2)
+        CurcumaLogger::info(fmt::format(
+            "Container: {} molecule(s) re-entered on the opposite side, {} reflected (destination occupied)",
+            wrapped, reflected));
 }
 
 // Claude Generated (Oct 2025): Apply Periodic Boundary Conditions
@@ -3305,12 +3969,24 @@ void SimpleMD::Verlet()
             if (std::abs(m_T0 - m_aver_Temp) < m_mtd_dT && m_step > 10) {
                 m_eval_mtd = true;
                 if (m_verbosity >= 1)
-                    std::cout << "Starting with MetaDynamics ..." << std::endl;
+                    CurcumaLogger::raw("Starting with MetaDynamics ...");
             }
         }
     }
 #endif
     WallPotential();
+    ApplyExtraPotential(); // Claude Generated 2026: e.g. NEB-MD z wall; part of trueGradient()
+    ApplyExternalPotentials();
+    // Claude Generated 2026: re-apply the external force so the second velocity half-kick
+    // sees it too (time-symmetric for a constant external force; see step()).
+    // Claude Generated 2026: remember the PURE gradient at the new position (potential +
+    // walls, no external force) for trueGradient(). gradient() alone is contaminated by
+    // the external force applied in this very step, which NEB-MD's mean-force estimators
+    // and its nudged-force projection must not see.
+    m_gradient_true = m_eigen_gradient;
+    m_gradient_true_valid = true;
+    if (m_external_forces_pending)
+        m_eigen_gradient += m_external_forces;
     ekin = 0.0;
 
     for (int i = 0; i < m_natoms; ++i) {
@@ -3334,6 +4010,7 @@ void SimpleMD::Verlet()
 
     // Claude Generated (Oct 2025): Apply PBC wrapping after integration step
     applyPeriodicBoundaryConditions();
+    wrapIntoContainer();
 }
 
 void SimpleMD::Rattle()
@@ -3524,6 +4201,76 @@ void SimpleMD::Rattle()
     m_rattle_iters_step1 = static_cast<int>(iter);
     m_rattle_constrained_atoms = static_cast<int>(constrained_atoms.size());
 
+    // Optional constraint on a general scalar function of the geometry (Claude Generated
+    // 2026). Classical SHAKE: the constraint force acts along grad(sigma) evaluated at the
+    // START of the step, R(t) (= m_eigen_geometry, not yet overwritten), so the position
+    // correction is dr = -mu * M^-1 * grad(sigma)(R(t)); only the multiplier mu is iterated
+    // (Newton on sigma(R) = target, slope grad(sigma)(R_k) . M^-1 grad(sigma)(R(t))).
+    // The same force is carried into the half-step velocity as dv = dr/dt - this term is
+    // REQUIRED: it is the component of the constraint impulse that the later RATTLE
+    // projection (along grad(sigma) at R(t+dt)) does not remove.
+    // Oct 2026 fix: the direction used to be re-evaluated at each SHAKE iterate R_k (a mass-
+    // weighted projection onto the constraint surface). That is not the symplectic RATTLE
+    // map and gave an NVE drift ~dt^2 that grew with the curvature of the constraint
+    // (ethane/GFN-FF, 2000 steps, dt 0.5 fs, 3 starts: C-H distance -4e-4..-6e-4 Eh,
+    // C-C +9e-5..+3e-4 Eh; fixed direction: |drift| <= 2.6e-5 Eh, free run ~1e-5..7e-5).
+    // It must happen HERE - before the kinetic energy is formed and before the thermostat
+    // runs - otherwise the constraint silently heats the system.
+    if (m_scalar_constraint) {
+        Geometry R(m_natoms, 3);
+        for (int a = 0; a < m_natoms; ++a)
+            for (int c3 = 0; c3 < 3; ++c3)
+                R(a, c3) = coord[3 * a + c3];
+        Geometry grad(m_natoms, 3);
+        Geometry grad_old(m_natoms, 3);
+        m_scalar_constraint(m_eigen_geometry, grad_old); // constraint-force direction at R(t)
+        const double inv_dT = 1.0 / dt; // dt = m_dT in the integrator time unit (FS_TO_MD_TIME), NOT fs
+        int sit = 0;
+        for (; sit < 100; ++sit) {
+            const double sigma = m_scalar_constraint(R, grad);
+            const double g = sigma - m_scalar_target;
+            if (std::abs(g) < m_scalar_tol)
+                break;
+            double Z = 0.0;
+            for (int a = 0; a < m_natoms; ++a)
+                Z += grad.row(a).dot(grad_old.row(a)) * m_eigen_inv_masses.data()[3 * a];
+            if (std::abs(Z) < 1e-30)
+                break;
+            const double mu = g / Z;
+            for (int a = 0; a < m_natoms; ++a) {
+                const double im = m_eigen_inv_masses.data()[3 * a];
+                for (int c3 = 0; c3 < 3; ++c3) {
+                    const double dr = -mu * im * grad_old(a, c3);
+                    R(a, c3) += dr;
+                    m_eigen_velocities.data()[3 * a + c3] += dr * inv_dT;
+                }
+            }
+        }
+        m_scalar_iters = sit;
+        // Remove the half-step velocity component along grad(sigma)(R(t+dt)). Not part of
+        // textbook RATTLE: with only the scalar constraint active it is redundant (the
+        // projection after the second half-kick removes the same direction again; removing
+        // it was measured to leave the drift unchanged to 6 digits, Oct 2026). Kept: removal
+        // is not proven bit-identical, and with bond RATTLE also active it feeds into the
+        // bond velocity stage (that combination is untested).
+        m_scalar_constraint(R, grad);
+        double Z = 0.0, vdot = 0.0;
+        for (int a = 0; a < m_natoms; ++a) {
+            Z += grad.row(a).squaredNorm() * m_eigen_inv_masses.data()[3 * a];
+            for (int c3 = 0; c3 < 3; ++c3)
+                vdot += m_eigen_velocities.data()[3 * a + c3] * grad(a, c3);
+        }
+        if (Z > 1e-30) {
+            const double nu = vdot / Z;
+            for (int a = 0; a < m_natoms; ++a)
+                for (int c3 = 0; c3 < 3; ++c3)
+                    m_eigen_velocities.data()[3 * a + c3] -= nu * m_eigen_inv_masses.data()[3 * a] * grad(a, c3);
+        }
+        for (int a = 0; a < m_natoms; ++a)
+            for (int c3 = 0; c3 < 3; ++c3)
+                coord[3 * a + c3] = R(a, c3);
+    }
+
     double ekin = 0;
 
     for (int i = 0; i < m_natoms; ++i) {
@@ -3562,12 +4309,24 @@ void SimpleMD::Rattle()
             if (std::abs(m_T0 - m_aver_Temp) < m_mtd_dT && m_step > 10) {
                 m_eval_mtd = true;
                 if (m_verbosity >= 1)
-                    std::cout << "Starting with MetaDynamics ..." << std::endl;
+                    CurcumaLogger::raw("Starting with MetaDynamics ...");
             }
         }
     }
 #endif
     WallPotential();
+    ApplyExtraPotential(); // Claude Generated 2026: e.g. NEB-MD z wall; part of trueGradient()
+    ApplyExternalPotentials();
+    // Claude Generated 2026: re-apply the external force so the second velocity half-kick
+    // sees it too (time-symmetric for a constant external force; see step()).
+    // Claude Generated 2026: remember the PURE gradient at the new position (potential +
+    // walls, no external force) for trueGradient(). gradient() alone is contaminated by
+    // the external force applied in this very step, which NEB-MD's mean-force estimators
+    // and its nudged-force projection must not see.
+    m_gradient_true = m_eigen_gradient;
+    m_gradient_true_valid = true;
+    if (m_external_forces_pending)
+        m_eigen_gradient += m_external_forces;
 
     for (int i = 0; i < m_natoms; ++i) {
         m_eigen_velocities.data()[3 * i + 0] -= 0.5 * dt * m_eigen_gradient.data()[3 * i + 0] * m_eigen_inv_masses.data()[3 * i + 0];
@@ -3662,6 +4421,30 @@ void SimpleMD::Rattle()
         CurcumaLogger::info("RATTLE 2nd step: max iterations reached (" + std::to_string(static_cast<int>(iter)) + ")");
         m_rattle_max_err_count++;
     }
+    // Second stage for the scalar constraint (Claude Generated 2026). The velocity
+    // projection MUST be repeated here, after the second half-kick: the kick reintroduces
+    // a component along grad(sigma), and leaving it there means the constraint does work
+    // on the system. That is the difference between SHAKE and RATTLE, and omitting it was
+    // measured to heat three of four constrained windows to death over 50000 steps while a
+    // 4000-step test still looked perfectly healthy.
+    if (m_scalar_constraint) {
+        Geometry grad(m_natoms, 3);
+        m_scalar_constraint(m_eigen_geometry, grad);
+        double Z = 0.0, vdot = 0.0;
+        for (int a = 0; a < m_natoms; ++a) {
+            Z += grad.row(a).squaredNorm() * m_eigen_inv_masses.data()[3 * a];
+            for (int c3 = 0; c3 < 3; ++c3)
+                vdot += m_eigen_velocities.data()[3 * a + c3] * grad(a, c3);
+        }
+        if (Z > 1e-30) {
+            const double nu = vdot / Z;
+            for (int a = 0; a < m_natoms; ++a)
+                for (int c3 = 0; c3 < 3; ++c3)
+                    m_eigen_velocities.data()[3 * a + c3]
+                        -= nu * m_eigen_inv_masses.data()[3 * a] * grad(a, c3);
+        }
+    }
+
     m_rattle_iters_step2 = static_cast<int>(iter);
 
     // Accumulate worst errors for periodic summary
@@ -3686,6 +4469,7 @@ void SimpleMD::Rattle()
 
     // Claude Generated (Oct 2025): Apply PBC wrapping after integration step
     applyPeriodicBoundaryConditions();
+    wrapIntoContainer();
 }
 
 // Claude Generated (Jul 2026): Milestone 2 held-force wrapper, called every step. The expensive bias
@@ -3763,6 +4547,15 @@ void SimpleMD::EvaluateBias(bool do_deposit)
     std::chrono::time_point<std::chrono::system_clock> m_start, m_end;
     m_start = std::chrono::system_clock::now();
     m_colvar_incr = 0;
+
+    // Claude Generated 2026: snapshot the gradient so the bias contribution added below can be
+    // isolated and (optionally) projected perpendicular to a given direction. Used by NEB-MD
+    // to keep the metadynamics from pushing an image along the reaction path. Costs one
+    // (natoms,3) copy per MTD call and only when a projection is set.
+    const bool project_bias = (m_mtd_projection.rows() == m_natoms && m_mtd_projection.cols() == 3);
+    Geometry gradient_before_bias;
+    if (project_bias)
+        gradient_before_bias = m_eigen_gradient;
 
     // RMSD-subset geometry for bias evaluation
     Geometry current_geometry = m_rmsd_mtd_molecule.getGeometry();
@@ -4201,8 +4994,21 @@ void SimpleMD::EvaluateBias(bool do_deposit)
         m_bias_structure_count++;
         m_rmsd_mtd_molecule.appendXYZFile(outputPath(Basename() + ".mtd.xyz"));
         if (m_verbosity >= 1)
-            std::cout << m_bias_structure_count << " stored structures currently" << std::endl;
+            CurcumaLogger::raw(m_bias_structure_count, " stored structures currently");
     }
+    // Claude Generated 2026: restrict the bias force to the plane perpendicular to
+    // m_mtd_projection (NEB-MD transverse metadynamics). The bias contribution is the
+    // difference to the snapshot taken at the top of this function; we project that
+    // difference and re-add it, leaving the physical gradient untouched.
+    if (project_bias) {
+        Geometry bias = m_eigen_gradient - gradient_before_bias;
+        double dot = 0.0;
+        for (int a = 0; a < m_natoms; ++a)
+            dot += bias.row(a).dot(m_mtd_projection.row(a));
+        bias -= dot * m_mtd_projection;
+        m_eigen_gradient = gradient_before_bias + bias;
+    }
+
     m_end = std::chrono::system_clock::now();
     int m_time = std::chrono::duration_cast<std::chrono::milliseconds>(m_end - m_start).count();
     m_mtd_time += m_time;
@@ -4377,8 +5183,8 @@ double SimpleMD::ApplySphericHarmonicWalls()
         /*
         if(out)
         {
-            std::cout << m_eigen_geometry.data()[3 * i + 0]  << " " << m_eigen_geometry.data()[3 * i + 1]  << " " << m_eigen_geometry.data()[3 * i + 2] << std::endl;
-            std::cout << dx << " " << dy << " " << dz << std::endl;
+            CurcumaLogger::raw(m_eigen_geometry.data()[3 * i + 0], " ", m_eigen_geometry.data()[3 * i + 1], " ", m_eigen_geometry.data()[3 * i + 2]);
+            CurcumaLogger::raw(dx, " ", dy, " ", dz);
         }*/
         // std::cout << distance << " ";
         potential += curr_pot;
@@ -4443,8 +5249,8 @@ double SimpleMD::ApplyRectHarmonicWalls()
         m_eigen_gradient.data()[3 * i + 2] += dz;
         /* if(out)
          {
-             std::cout << m_eigen_geometry.data()[3 * i + 0]  << " " << m_eigen_geometry.data()[3 * i + 1]  << " " << m_eigen_geometry.data()[3 * i + 2] << std::endl;
-             std::cout << dx << " " << dy << " " << dz << std::endl;
+             CurcumaLogger::raw(m_eigen_geometry.data()[3 * i + 0], " ", m_eigen_geometry.data()[3 * i + 1], " ", m_eigen_geometry.data()[3 * i + 2]);
+             CurcumaLogger::raw(dx, " ", dy, " ", dz);
          }*/
         sum_grad += std::abs(dx) + std::abs(dy) + std::abs(dz);
 
@@ -4729,9 +5535,9 @@ void SimpleMD::PrintStatus() const
 
 void SimpleMD::PrintMatrix(const double* matrix) const
 {
-    std::cout << "Print Matrix" << std::endl;
+    CurcumaLogger::raw("Print Matrix");
     for (int i = 0; i < m_natoms; ++i) {
-        std::cout << matrix[3 * i] << " " << matrix[3 * i + 1] << " " << matrix[3 * i + 2] << std::endl;
+        CurcumaLogger::raw(matrix[3 * i], " ", matrix[3 * i + 1], " ", matrix[3 * i + 2]);
     }
     std::cout << std::endl;
 }
@@ -4824,7 +5630,11 @@ bool SimpleMD::WriteGeometry()
         geometry(i, 1) = m_eigen_geometry.data()[3 * i + 1];
         geometry(i, 2) = m_eigen_geometry.data()[3 * i + 2];
     }
-    TriggerWriteRestart();
+    // K6 (Oct 2026): keep the state for the -rescue history in step(); unused otherwise.
+    if (m_rescue)
+        m_last_dump_state = TriggerWriteRestart();
+    else
+        TriggerWriteRestart();
     m_molecule.setGeometry(geometry);
 
     // Claude Generated (Nov 2025): Write VTF trajectory for CG systems
@@ -4842,7 +5652,7 @@ bool SimpleMD::WriteGeometry()
     if (m_writeUnique) {
         if (m_unqiue->CheckMolecule(new Molecule(m_molecule))) {
             if (m_verbosity >= 1)
-                std::cout << " ** new structure was added **" << std::endl;
+                CurcumaLogger::raw(" ** new structure was added **");
             PrintStatus();
             m_time_step = 0;
             m_unique_structures.push_back(new Molecule(m_molecule));
@@ -4869,18 +5679,17 @@ void SimpleMD::CSVR()
 {
     double Ekin_target = 0.5 * kb_Eh * (m_T0)*m_dof;
     double c = exp(-(m_dT / 2.0 * m_respa) / m_coupling);
-    static std::normal_distribution<> d{ 0, 1 };
     // Lazy-reinit when m_dof changes (e.g. after RATTLE constraint setup or
-    // first call with a different molecule). A stale static distribution with
-    // the wrong DOF produces wrong fluctuation widths in the CSVR rescaling.
-    static int csvr_last_dof = -1;
-    static std::chi_squared_distribution<float> dchi{ 1.0f };
-    if (m_dof != csvr_last_dof) {
-        dchi = std::chi_squared_distribution<float>(static_cast<float>(m_dof));
-        csvr_last_dof = m_dof;
+    // first call with a different molecule). A stale distribution with the wrong DOF
+    // produces wrong fluctuation widths in the CSVR rescaling.
+    if (m_dof != m_csvr_last_dof) {
+        // Claude Generated: Bussi 2007 (JCP 126, 014101) Eq. A7: R1 is drawn separately,
+        // the remaining sum of squares is chi2(Nf-1), not chi2(Nf).
+        m_csvr_chi = std::chi_squared_distribution<float>(static_cast<float>(std::max(1, static_cast<int>(m_dof) - 1)));
+        m_csvr_last_dof = m_dof;
     }
-    double R = d(m_rng);
-    double SNf = dchi(m_rng);
+    double R = m_csvr_norm(m_rng);
+    double SNf = m_csvr_chi(m_rng);
     double alpha2 = c + (1 - c) * (SNf + R * R) * Ekin_target / (m_dof * m_Ekin) + 2 * R * sqrt(c * (1 - c) * Ekin_target / (m_dof * m_Ekin));
     m_Ekin_exchange += m_Ekin * (alpha2 - 1);
     double alpha = sqrt(alpha2);
@@ -4943,4 +5752,56 @@ void SimpleMD::NoseHover()
         m_xi[j] += 0.5 * dt * (m_Q[j - 1] * m_xi[j - 1] * m_xi[j - 1] - m_T0 * kb_Eh) / m_Q[j];
     }
     m_xi[0] += 0.5 * dt * (2.0 * kinetic_energy - m_dof * m_T0 * kb_Eh) / m_Q[0];
+}
+
+// Claude Generated 2026 - see the header.
+double SimpleMD::containerVolume() const
+{
+    // 1 = spheric, 2 = rect; anything else is no container. A wall whose bounds
+    // are all still zero is auto-sized by the run and has no volume to report yet.
+    if (m_wall_type == 1) {
+        const double r = m_wall_spheric_radius;
+        return r > 0.0 ? 4.0 / 3.0 * pi * r * r * r : 0.0;
+    }
+    if (m_wall_type == 2) {
+        const double dx = m_wall_x_max - m_wall_x_min;
+        const double dy = m_wall_y_max - m_wall_y_min;
+        const double dz = m_wall_z_max - m_wall_z_min;
+        if (dx > 0.0 && dy > 0.0 && dz > 0.0)
+            return dx * dy * dz;
+    }
+    return 0.0;
+}
+
+double SimpleMD::density() const
+{
+    return m_molecule.Density(containerVolume());
+}
+
+json SimpleMD::Results() const
+{
+    json result;
+    result["steps"] = m_step;
+    result["time_fs"] = m_currentStep;
+    result["potential_energy"] = m_Epot;
+    result["kinetic_energy"] = m_Ekin;
+    result["total_energy"] = m_Epot + m_Ekin;
+    result["temperature"] = m_T;
+    result["target_temperature"] = m_T0;
+    // What the external potentials did. The work is the number a Jarzynski or
+    // Crooks estimate is built from; the energy alone is origin-dependent for a
+    // constant force.
+    if (!m_external_potentials.empty()) {
+        result["external_potentials"] = externalPotentials();
+        double work = 0.0;
+        for (const curcuma::ExternalPotential& potential : m_external_potentials)
+            work += potential.work;
+        result["external_work"] = work;
+    }
+    const double volume = containerVolume();
+    if (volume > 0.0) {
+        result["container_volume"] = volume;          // Angstrom^3
+        result["density"] = m_molecule.Density(volume); // g/cm^3
+    }
+    return result;
 }

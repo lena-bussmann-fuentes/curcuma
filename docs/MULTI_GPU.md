@@ -27,7 +27,7 @@ Caveat: the polymer (1410 atoms) runs had ollama occupying 9-12 GB per GPU; the 
 
 - GFN-FF single point is >98 % CPU setup (topology + parameters); the GPU energy call is 137 ms. Gate G0e: passed -> multi-GPU cannot speed up a GFN-FF SP.
 - GPU gfn2/gfn1 wall minus reported TOTAL: ~0.7-1 s untimed (context/plugin init, uploads).
-- GFN-FF CPU vs GPU energy differs by 5.7e-7 Eh on polymer_2x (not investigated; GPU EEQ cutoff suspected). **Superseded (Sep 25, 2026)**: the cause was different Bohr radii in the CPU and GPU CN radii; CPU == GPU to all 10 printed decimals since, CLAUDE.md Known Issue #33(a).
+- GFN-FF CPU vs GPU energy differs by 5.7e-7 Eh on polymer_2x (not investigated; GPU EEQ cutoff suspected). **Superseded (Sep 25, 2026)**: the cause was different Bohr radii in the CPU and GPU CN radii; CPU == GPU to all 10 printed decimals since, KNOWN_ISSUES_ARCHIVE.md Known Issue #33(a).
 
 ### GFN-FF MD, polymer_2x, 50 steps, dt 1 fs, -threads 36 (GPU run used the wrong gradient unit, see below)
 
@@ -52,7 +52,7 @@ Caveat: the polymer (1410 atoms) runs had ollama occupying 9-12 GB per GPU; the 
 
 ### Dense eigensolver, n = 15444 (GFN2 nao of polymer_2x), random symmetric matrix
 
-Tool: `test_cases/cuda/bench_syevd_mg.cpp` (standalone, build line in its header). Solve time only; data already on the device(s). Eigenvalues Dn vs Mg agree to 1e-13.
+Tool: `scripts/gpu_bench/bench_syevd_mg.cpp` (standalone, build line in its header). Solve time only; data already on the device(s). Eigenvalues Dn vs Mg agree to 1e-13.
 
 | Solver | GPUs | FP64 | FP32 | memory per GPU (FP64) |
 |---|---|---|---|---|
@@ -66,7 +66,7 @@ Tool: `test_cases/cuda/bench_syevd_mg.cpp` (standalone, build line in its header
 - On the A4500 FP32 is 6.6x faster than FP64. Multi-GPU therefore only helps the FP64 iterations (the final polishing steps of the mixed-precision SCF) and as a memory enabler (4.0 vs 9.1 GB per device).
 - PCIe topology (PIX vs NODE) makes no measurable difference here.
 - `cusolverMg` is marked **deprecated** in CUDA 13.3 (successor: cuSOLVERMp on NCCL/CAL). Integrated as FP64-only fallback; the eigenvalue-sum check used here did not catch its unusable FP32 eigenvectors at this size (see step 3).
-- cuSOLVERMp 0.9.1 (same matrix): FP64 1 GPU 50.2 s, 2 GPUs 36.3 s, 4 GPUs 20.7 s (nb 128); FP32 4 GPUs 5.24 s, 2 GPUs 7.36 s; 1.5-2.7 GB per GPU. Tool: `test_cases/cuda/bench_syevd_mp.cpp`.
+- cuSOLVERMp 0.9.1 (same matrix): FP64 1 GPU 50.2 s, 2 GPUs 36.3 s, 4 GPUs 20.7 s (nb 128); FP32 4 GPUs 5.24 s, 2 GPUs 7.36 s; 1.5-2.7 GB per GPU. Tool: `scripts/gpu_bench/bench_syevd_mp.cpp`.
 - Cusolver Mg layout pitfall: the column blocks are dealt out **cyclically** (block b -> device b % ndev). A contiguous layout returns wrong eigenvalues without any error.
 
 ### Not yet measured
@@ -333,6 +333,34 @@ the size-guard work), so: one run on the largest structure you have.
 **7. Batch throughput**, if the node has 4 or 8 cards: `-sp` on a multi-XYZ file with
 `-gpu_devices 0,1,2,3 -gpu_workers_per_device 1|2`. Independent of everything above and the
 easiest real-world win.
+
+**8. GFN-FF MD on the H200 node (added Oct 18, 2026).** The same questions for the force field, which
+is bound by the host and the many small kernels rather than by an eigensolver. Needs the build of item 0
+(`-DCMAKE_CUDA_ARCHITECTURES=90`); the multi-GPU eigensolver libraries are not used by GFN-FF.
+```bash
+python scripts/tuning_sweep.py scripts/gpu_bench/run/polymer_2x.xyz --method gfnff --gpu cuda --md \
+       --repeats 2 --json h200_gfnff_md.json -- -threads 16
+```
+(`--md` times milliseconds per MD step from runs of 100 and 600 steps, after one discarded warm-up run; every
+setting is checked against the baseline energy of the last step. Estimated 45 min on the A4500 box (about 90 runs of 30 s, not timed as a whole); `--md-steps 50,300`
+halves it. Pass `-threads N` after `--` to fix the host threads; without it the `threads` knob scans 4 to all cores.)
+Reference, 4x RTX A4500 (PCIe, no NVLink), polymer_2x (7320 atoms), 16 host threads, 2 repeats, Oct 18, 2026:
+`-gpu_split_devices none` 41.3 ms/step, `0,1` 25.2, `0,1,2` 20.2, `all` (4 GPUs) 18.6 to 19.1, `auto` 19.1.
+Before the sweep, one MD step profile for the record: `nsys profile -o gfnff_h200 curcuma -md polymer_2x.xyz
+-method gfnff -gpu cuda -T 300 -dt 1 -max_time 100 -print 100000 -threads 16 -no_bmt -verbosity 0`
+(per-device busy time and the PCG span, see GPU_TUNING.md "GFN-FF split path").
+
+What to look at, as hypotheses to confirm or refute (none of this is measured on an H200):
+- **FP64 rate.** The matrix build (`k_eeq_build_cols`, 1.3 ms per call on the A4500) and `k_coulomb_tiles` are FP64-bound there
+  (1/64 rate); the H200 runs FP64 at 1/2 of FP32. If so, `gpu_eeq_mixed_precision false` stops costing accuracy for nothing and
+  may even win: compare `true|false` and `gpu_eeq_mixed_rho`.
+- **Split ladder.** On PCIe one GPU takes 41 ms and four 19 ms. With NVLink the peer copies per matvec get cheaper; with a much faster single
+  card the split may stop paying (`none` against `all`), and `gpu_split_min_atoms` / `gpu_split_eeq_min_atoms` (1000 / 4000, measured on the A4500) move.
+- **Host stages.** HB/XB detection (20 ms per refresh at 8 threads, 10 ms at 32) and the integrator gap are host work; on a node with many
+  cores the `threads` knob decides how much of the step is left. Bring the `threads` rows back too.
+- **What it should reproduce.** The result of a setting is bitwise independent of load and of the number of split GPUs (Oct 17, 2026,
+  docs/GPU_REPRODUCIBILITY.md, A4500 only): the SUSPECT mark of the sweep should never fire for the split knobs; if it does on the H200, that is a finding.
+Not scanned on purpose: `hb_update_force_every` (changes the trajectory, decision pending, TODO.md).
 
 ## Operator runs on other hardware (Sep 17/18, 2026)
 

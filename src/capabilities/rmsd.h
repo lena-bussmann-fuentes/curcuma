@@ -191,6 +191,11 @@ public:
 
     /*! \brief Best-fit RMSD after reordering (the permutation RMSD); equals the plain value
      *  when no reordering ran. */
+    /// Claude Generated 2026 - What this run computed, without the caller's
+    /// context: the file names that appear in the CLI's .rmsd.json are the CLI's
+    /// own concern and are added there. Pure -- writes nothing.
+    json Results() const override;
+
     inline double RMSD() const { return m_rmsd; }
 
     /*! \brief Plain best-fit RMSD in the original atom order, WITHOUT reordering. Only
@@ -281,10 +286,19 @@ public:
 
     void setThreads(int threads) { m_threads = threads; }
 
-    bool MolAlignLib();
     static std::pair<double, Matrix> MakeCostMatrix(const Geometry& reference, const Geometry& target, const std::vector<int>& reference_atoms, const std::vector<int>& target_atoms, int costmatrix);
 
     Geometry Gradient() const;
+
+    /*! \brief RMSD * d(RMSD)/dR, i.e. the gradient with its 1/RMSD factor cancelled.
+     *
+     *  Gradient() is (ref - tar)/(RMSD*N) and therefore singular where the target
+     *  coincides with the reference. Every consumer that multiplies the gradient by the
+     *  RMSD again - as the path collective variable does, because the chain rule of a
+     *  Gaussian in d^2 produces a factor 2*lambda*d - can use this form instead and never
+     *  divide at all. Analytically identical, regular everywhere.
+     *  Claude Generated 2026. */
+    Geometry GradientTimesRMSD() const;
 
     // Claude Generated - Public helper methods for Strategy Pattern access
     Geometry CenterMolecule(const Molecule& mol, int fragment) const;
@@ -298,8 +312,6 @@ public:
     std::pair<double, Matrix> MakeCostMatrix(const Geometry& reference, const Geometry& target);
     std::pair<double, Matrix> MakeCostMatrix(const std::vector<int>& reference, const std::vector<int>& target);
     std::pair<double, Matrix> MakeCostMatrix(const Matrix& rotation);
-    std::pair<std::vector<int>, std::vector<int>> PrepareHeavyTemplate();
-    std::pair<std::vector<int>, std::vector<int>> PrepareAtomTemplate(const std::vector<int>& templateatom);
 
 private:
     /* Read Controller has to be implemented for all */
@@ -332,10 +344,6 @@ private:
     void CheckTopology();
 
     Matrix OptimiseRotation(const Eigen::Matrix3d& rotation);
-
-    std::pair<std::vector<int>, std::vector<int>> PrepareDistanceTemplate();
-
-    std::pair<std::vector<int>, std::vector<int>> PrepareAtomTemplate(int templateatom);
 
     void FinaliseTemplate();
 
@@ -420,9 +428,11 @@ private:
     // vvvvvvvvvvvv PARAMETER DEFINITION BLOCK vvvvvvvvvvvv
     // Claude Generated - Parameter Registry Integration (October 2025)
     BEGIN_PARAMETER_DEFINITION(rmsd)
+    MODULE_INFO("RMSD between two structures, with atom reordering and fragment-wise alignment.", "Analysis", {"rmsd"})
 
     // --- General & Threading ---
-    PARAM(threads, Int, 1, "Number of threads for parallel execution.", "Performance", {})
+    PARAM(threads, Int, 1, "Number of threads for parallel execution.", "Performance", {},
+        "min=1")
     /* Claude Generated (Aug 2026): 'heavy' used to be a plain alias of 'protons', which
        inverted its meaning - a bare CLI flag becomes true, so '-heavy' asked for
        protons=true, i.e. the exact opposite of heavy-only, and only '-heavy false'
@@ -435,7 +445,8 @@ private:
     PARAM(no_reorder, Bool, false, "Disable all reordering logic.", "General", {"noreorder"})
 
     // --- Alignment Method ---
-    PARAM(method, String, "subspace", "Alignment method: subspace (default, recommended)|inertia (recommended)|template|dtemplate|incr (legacy)|molalign (external)|hungarian|predefined.", "Method", {"RMSDmethod", "rmsdmethod"})
+    PARAM(method, String, "subspace", "Alignment method: subspace (default, recommended)|inertia (recommended)|template|dtemplate|incr (legacy)|molalign (external)|hungarian|predefined.", "Method", {"RMSDmethod", "rmsdmethod"},
+        "tier=primary; enum=subspace|inertia|template|dtemplate|incr|molalign|hungarian|predefined")
     PARAM(limit, Int, 0, "Limit for subspace and dtemplate methods.", "Method", {})
     PARAM(element, String, "7", "Element(s) for template methods (e.g., \"7,8\").", "Method", {"Element"})
     PARAM(order_file, String, "", "Path to a file with a predefined atom order.", "Method", {"order"})
