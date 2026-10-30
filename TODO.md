@@ -177,6 +177,8 @@ Stand.
 
 Code-gebundene Entscheidungen, die bei Ihnen liegen. Fachliche Fragen und Projektstatus stehen im Vault und sind nur verlinkt.
 
+- **GMTKN55 `G21EA/EA_16` (SiH3-) mit gfn1**: curcuma bricht mit "implausible charge distribution" ab (max |q| 5.55 > 5.00, auch aus H0). xtb 6.7 konvergiert auf dieselbe SCC-Energie (-7.94141906 Eh) mit Si = -5.55 e, also derselbe q^3-Runaway. Fehler behalten (jetziges Verhalten) oder Grenze/Schalter? Die Struktur fehlt deshalb in jedem gfn1-Vergleich.
+
 - Branch `feature/nebmd-path-sampling` nach master mergen? (enthält überwiegend Master-Arbeit; `/pre-merge-check` fällig.) NEB-MD-Status: Vault `Projekte/curcuma NEB-MD Pfad-Sampling`.
 - `-scf_pseudo_diag` als Standard einschalten? (Messungen sprechen dafür, Abschnitt 2.)
 - `-scf_precond_guard`: Vorgabe `g2:4:best` kostet auf dem unrelaxierten 599-Atom-Cluster bei 8 Threads 4 Iterationen gegen `none` (Kriterium war <= 3);
