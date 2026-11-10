@@ -2037,8 +2037,12 @@ void showStructuredHelp(const std::string& category = "") {
         std::cout << "  curcuma -traj md_output.xyz -stride 10     # Trajectory analysis" << std::endl;
         std::cout << std::endl;
 
-        std::cout << "Get detailed help: curcuma -help [category]" << std::endl;
-        std::cout << "   Available categories: ";
+        std::cout << "Specialized Help:" << std::endl;
+        std::cout << "  curcuma -help-plumed          PLUMED metadynamics guide" << std::endl;
+        std::cout << "  curcuma -help-module <module>  Parameter reference for a module" << std::endl;
+        std::cout << "  curcuma -help [category]       Category overview" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Available categories: ";
         bool first = true;
         for (const auto& [cat, capabilities] : categories) {
             if (!first) std::cout << ", ";
@@ -2097,6 +2101,9 @@ void showStructuredHelp(const std::string& category = "") {
                 std::cout << "Dynamics Examples:" << std::endl;
                 std::cout << "  curcuma -md system.xyz -temperature 300 -steps 10000" << std::endl;
                 std::cout << "  curcuma -casino polymer.vtf -move_type mixed -adaptive_step true" << std::endl;
+                std::cout << "  curcuma -md system.xyz -mtd -plumed plumed.dat  # metadynamics with PLUMED" << std::endl;
+                std::cout << std::endl;
+                std::cout << "For PLUMED metadynamics help: curcuma -help-plumed" << std::endl;
             } else if (category == "optimization") {
                 std::cout << "Optimization Examples:" << std::endl;
                 std::cout << "  curcuma -opt molecule.xyz -method uff" << std::endl;
@@ -2305,6 +2312,62 @@ int main(int argc, char **argv) {
         }
         std::string module = argv[2];
         ParameterRegistry::getInstance().printHelp(module);
+        return 0;
+    }
+
+    // PLUMED metadynamics help
+    if (command == "help_plumed" || command == "help-plumed") {
+        std::cout << "PLUMED Metadynamics Guide" << std::endl;
+        std::cout << "========================" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Enhanced-sampling MD via the PLUMED2 plugin." << std::endl;
+        std::cout << "Requires building with -DUSE_Plumed=ON (off by default)." << std::endl;
+        std::cout << std::endl;
+        std::cout << "CLI flags:" << std::endl;
+        std::cout << "  -mtd                Enable PLUMED metadynamics" << std::endl;
+        std::cout << "  -plumed <file>      Path to PLUMED input file (default: plumed.dat)" << std::endl;
+        std::cout << "  -mtd_dT <int>       Temperature threshold for MTD start (K, default: -1 = active from step 0)" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Quick start:" << std::endl;
+        std::cout << "  curcuma -md input.xyz -method gfnff -mtd" << std::endl;
+        std::cout << "  curcuma -md input.xyz -method gfnff -mtd -plumed plumed.dat" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Minimal plumed.dat example (well-tempered metadynamics on a distance CV):" << std::endl;
+        std::cout << "  DISTANCE ATOMS=1,2 LABEL=d1" << std::endl;
+        std::cout << "  METAD ..." << std::endl;
+        std::cout << "    ARG=d1 PACE=500 HEIGHT=1.2 SIGMA=0.1" << std::endl;
+        std::cout << "    BIASFACTOR=10 TEMP=298.15 FILE=HILLS" << std::endl;
+        std::cout << "  ... METAD" << std::endl;
+        std::cout << "  PRINT ARG=d1 STRIDE=100 FILE=COLVAR" << std::endl;
+        std::cout << std::endl;
+        std::cout << "How it works:" << std::endl;
+        std::cout << "  Each MD step, Curcuma passes positions (Angstrom -> Bohr)," << std::endl;
+        std::cout << "  energy, forces, and masses to PLUMED. PLUMED computes" << std::endl;
+        std::cout << "  collective variables and bias potentials, then modifies" << std::endl;
+        std::cout << "  the force array in place." << std::endl;
+        std::cout << std::endl;
+        std::cout << "Thermal equilibration gate (-mtd_dT):" << std::endl;
+        std::cout << "  If -mtd_dT N (N >= 0) is set, PLUMED is deferred until the" << std::endl;
+        std::cout << "  average temperature is within N K of the target and at least" << std::endl;
+        std::cout << "  10 steps have elapsed. Default (-1): active from step 0." << std::endl;
+        std::cout << std::endl;
+        std::cout << "Output files (written by PLUMED):" << std::endl;
+        std::cout << "  plumed_log.out  - PLUMED master log" << std::endl;
+        std::cout << "  HILLS           - Gaussian hills for free-energy reconstruction" << std::endl;
+        std::cout << "  COLVAR          - Collective variable values" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Available PLUMED features (configured in plumed.dat):" << std::endl;
+        std::cout << "  METAD (standard/well-tempered), RESTRAINT, LOWER/UPPER_WALLS," << std::endl;
+        std::cout << "  MOVINGRESTRAINT, COORDINATION, PATHCV, PATHMSD, HISTOGRAM, ..." << std::endl;
+        std::cout << std::endl;
+        std::cout << "Internal RMSD-MTD alternative (no PLUMED needed):" << std::endl;
+        std::cout << "  -rmsd_mtd               Enable RMSD-based metadynamics" << std::endl;
+        std::cout << "  -rmsd_mtd_k <double>    Force constant (default: 0.1)" << std::endl;
+        std::cout << "  -rmsd_mtd_alpha <double> Gaussian width (default: 10.0)" << std::endl;
+        std::cout << "  -rmsd_mtd_pace <int>    Deposition frequency (default: 1)" << std::endl;
+        std::cout << std::endl;
+        std::cout << "Full documentation: docs/PLUMED_HELP.md" << std::endl;
+        std::cout << "PLUMED manual: https://www.plumed.org/doc-v2.9/" << std::endl;
         return 0;
     }
 

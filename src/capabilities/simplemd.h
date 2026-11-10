@@ -295,6 +295,8 @@ private:
     std::vector<std::pair<std::pair<int, int>, double>> m_bond_constrained, m_bond_13_constrained;
 #ifdef USE_Plumed
     plumed m_plumedmain;
+    std::vector<double> m_plumed_positions;  // Positions in Bohr for PLUMED
+    double m_plumed_box[9] = {};             // Box vectors in Bohr for PLUMED (3x3 row-major)
 #endif
 
     int m_natoms = 0;

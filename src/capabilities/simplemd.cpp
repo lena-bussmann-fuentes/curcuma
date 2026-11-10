@@ -410,6 +410,8 @@ void SimpleMD::printHelp() const
               << "- RATTLE constraints allow larger timesteps for bonds involving H atoms\n"
               << "- Wall potentials prevent molecules from drifting too far\n"
               << "- Metadynamics helps explore conformational space efficiently\n"
+              << "\nPLUMED Metadynamics:\n"
+              << "  Enable with -mtd. Detailed help: curcuma -help-plumed\n"
               << std::endl;
 }
 
@@ -1658,7 +1660,7 @@ void SimpleMD::prepareRun()
         m_plumedmain = plumed_create();
         int real_precision = 8;
         double energyUnits = 2625.5;
-        double lengthUnits = 10;
+        double lengthUnits = 0.0529177210903;  // Bohr to nm (1 Bohr = 0.0529 nm)
         double timeUnits = 1e-3;
         double massUnits = 1;
         double chargeUnit = 1;
@@ -1672,17 +1674,32 @@ void SimpleMD::prepareRun()
         plumed_cmd(m_plumedmain, "setMDMassUnits", &massUnits); // Pass a pointer to the conversion factor between the mass unit used in your code and amu
         plumed_cmd(m_plumedmain, "setMDChargeUnits", &chargeUnit);
         plumed_cmd(m_plumedmain, "setTimestep", &m_dT); // Pass a pointer to the molecular dynamics timestep to plumed                       // Pass the name of your md engine to plumed (now it is just a label)
-        plumed_cmd(m_plumedmain, "setKbT", &kb_Eh);
+        double kbt = kb_Eh * m_T0;  // k_B * T in Hartree (PLUMED expects k_B*T, not just k_B)
+        plumed_cmd(m_plumedmain, "setKbT", &kbt);
         plumed_cmd(m_plumedmain, "setLogFile", "plumed_log.out"); // Pass the file  on which to write out the plumed log (to be created)
         plumed_cmd(m_plumedmain, "setRestart", &restart); // Pointer to an integer saying if we are restarting (zero means no, one means yes)
         plumed_cmd(m_plumedmain, "init", NULL);
         plumed_cmd(m_plumedmain, "read", m_plumed.c_str());
         plumed_cmd(m_plumedmain, "setStep", &m_step);
-        plumed_cmd(m_plumedmain, "setPositions", &m_eigen_geometry.data()[0]);
+        // Convert positions from Angstrom to Bohr for consistent PLUMED unit system
+        // (forces are already in Hartree/Bohr, positions must match)
+        m_plumed_positions.resize(3 * m_natoms);
+        for (int i = 0; i < 3 * m_natoms; i++) {
+            m_plumed_positions[i] = m_eigen_geometry[i] / au;  // Angstrom -> Bohr
+        }
+        plumed_cmd(m_plumedmain, "setPositions", m_plumed_positions.data());
         plumed_cmd(m_plumedmain, "setEnergy", &m_Epot);
         plumed_cmd(m_plumedmain, "setForces", &m_eigen_gradient.data()[0]);
         plumed_cmd(m_plumedmain, "setVirial", &m_virial[0]);
         plumed_cmd(m_plumedmain, "setMasses", &m_eigen_masses.data()[0]);
+        if (m_has_pbc) {
+            // Convert box vectors from Angstrom to Bohr (consistent with position conversion)
+            Eigen::Matrix3d box_bohr = m_molecule.getUnitCell() / au;
+            m_plumed_box[0] = box_bohr(0, 0); m_plumed_box[1] = box_bohr(0, 1); m_plumed_box[2] = box_bohr(0, 2);
+            m_plumed_box[3] = box_bohr(1, 0); m_plumed_box[4] = box_bohr(1, 1); m_plumed_box[5] = box_bohr(1, 2);
+            m_plumed_box[6] = box_bohr(2, 0); m_plumed_box[7] = box_bohr(2, 1); m_plumed_box[8] = box_bohr(2, 2);
+            plumed_cmd(m_plumedmain, "setBox", m_plumed_box);
+        }
         plumed_cmd(m_plumedmain, "prepareCalc", NULL);
         plumed_cmd(m_plumedmain, "performCalc", NULL);
     }
@@ -2106,13 +2123,20 @@ void SimpleMD::Verlet()
     if (m_mtd) {
         plumed_cmd(m_plumedmain, "setStep", &m_step);
 
-        plumed_cmd(m_plumedmain, "setPositions", &m_eigen_geometry.data()[0]);
+        // Convert positions from Angstrom to Bohr for consistent PLUMED unit system
+        for (int i = 0; i < 3 * m_natoms; i++) {
+            m_plumed_positions[i] = m_eigen_geometry[i] / au;
+        }
+        plumed_cmd(m_plumedmain, "setPositions", m_plumed_positions.data());
 
         plumed_cmd(m_plumedmain, "setEnergy", &m_Epot);
         plumed_cmd(m_plumedmain, "setForces", &m_eigen_gradient.data()[0]);
         plumed_cmd(m_plumedmain, "setVirial", &m_virial[0]);
 
         plumed_cmd(m_plumedmain, "setMasses", &m_eigen_masses.data()[0]);
+        if (m_has_pbc) {
+            plumed_cmd(m_plumedmain, "setBox", m_plumed_box);
+        }
         if (m_eval_mtd) {
             plumed_cmd(m_plumedmain, "prepareCalc", NULL);
             plumed_cmd(m_plumedmain, "performCalc", NULL);
@@ -2351,13 +2375,20 @@ void SimpleMD::Rattle()
     if (m_mtd) {
         plumed_cmd(m_plumedmain, "setStep", &m_step);
 
-        plumed_cmd(m_plumedmain, "setPositions", &m_eigen_geometry.data()[0]);
+        // Convert positions from Angstrom to Bohr for consistent PLUMED unit system
+        for (int i = 0; i < 3 * m_natoms; i++) {
+            m_plumed_positions[i] = m_eigen_geometry[i] / au;
+        }
+        plumed_cmd(m_plumedmain, "setPositions", m_plumed_positions.data());
 
         plumed_cmd(m_plumedmain, "setEnergy", &m_Epot);
         plumed_cmd(m_plumedmain, "setForces", &m_eigen_gradient.data()[0]);
         plumed_cmd(m_plumedmain, "setVirial", &m_virial[0]);
 
         plumed_cmd(m_plumedmain, "setMasses", &m_eigen_masses.data()[0]);
+        if (m_has_pbc) {
+            plumed_cmd(m_plumedmain, "setBox", m_plumed_box);
+        }
         if (m_eval_mtd) {
             plumed_cmd(m_plumedmain, "prepareCalc", NULL);
             plumed_cmd(m_plumedmain, "performCalc", NULL);
